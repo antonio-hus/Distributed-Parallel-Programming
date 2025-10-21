@@ -17,3 +17,6 @@
 # Ignore other OS or editor files
 .DS_Store
 Thumbs.db
+
+# Ignore binaries
+/bin/

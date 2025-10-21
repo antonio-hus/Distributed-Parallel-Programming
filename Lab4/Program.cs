@@ -260,7 +260,6 @@ class HttpDownloaderCallbacks
             _receivedData.Append(chunk);
             
             // STATE MACHINE: Process data based on current parsing state
-            
             if (_state == ParserState.RequestSent || _state == ParserState.ReadingHeaders)
             {
                 // Still parsing headers - look for end of headers marker "\r\n\r\n"
@@ -1054,7 +1053,7 @@ class Program
         // Define test URLs to download
         List<DownloadRequest> requests = new List<DownloadRequest>
         {
-            new DownloadRequest { Host = "www.cs.ubbcluj.ro", Path = "/~rlupsa/", Port = 80, Id = "cs.ubbcluj.ro" },
+            new DownloadRequest { Host = "www.cs.ubbcluj.ro", Path = "/~rlupsa/edu/pdp/lab-4-futures-continuations.html", Port = 80, Id = "cs.ubbcluj.ro" },
             new DownloadRequest { Host = "www.textfiles.com", Path = "/100/914bbs.txt", Port = 80, Id = "textfiles.com" }
         };
         

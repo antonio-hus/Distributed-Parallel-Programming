@@ -281,10 +281,10 @@ List<DownloadRequest> requests = new List<DownloadRequest>
 ### Typical Results (2 concurrent downloads)
 
 | Implementation | Total Time | Downloads/sec | Status |
-|----------------|-----------|---------------|--------|
-| Direct Callbacks | ~850ms | 2.35 | ✓ PASS |
-| Task-Based | ~870ms | 2.30 | ✓ PASS |
-| Async/Await | ~840ms | 2.38 | ✓ PASS |
+|----------------|------------|---------------|--------|
+| Direct Callbacks | ~368.74ms  | 5.43 | ✓ PASS |
+| Task-Based | ~403.73ms  | 4.95 | ✓ PASS |
+| Async/Await | ~411.13ms  | 4.87 | ✓ PASS |
 
 **Note:** Performance is nearly identical across implementations. The main differences are in code clarity and maintainability.
 

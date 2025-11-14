@@ -2,17 +2,18 @@
 
 ## Problem Statement
 
-Goal
+### Goal
 The goal of this lab is to implement a simple but non-trivial parallel algorithm.
 
-Requirement
-Perform the multiplication of 2 polynomials. Use both the regular O(n2) algorithm and the Karatsuba algorithm, and each in both the sequencial form and a parallelized form. Compare the 4 variants.
+### Requirement
+Perform the multiplication of 2 polynomials. Use both the regular O(n²) algorithm and the Karatsuba algorithm, and each in both the sequential form and a parallelized form. Compare the 4 variants.
 
 The documentation will describe:
-- the algorithms,
-- the synchronization used in the parallelized variants,
-- the performance measurements
-Bonus: do the same for big numbers.
+- The algorithms
+- The synchronization used in the parallelized variants
+- The performance measurements
+
+**Bonus:** Do the same for big numbers.
 
 ---
 
@@ -22,10 +23,10 @@ Bonus: do the same for big numbers.
 
 #### Theory
 - Given two polynomials:
-  - \(A(x) = \sum_{i=0}^{n-1} a_i x^i\)
-  - \(B(x) = \sum_{j=0}^{m-1} b_j x^j\)
+  - A(x) = Σ(i=0 to n-1) aᵢxⁱ
+  - B(x) = Σ(j=0 to m-1) bⱼxʲ
 - The classical approach computes each result coefficient independently as:
-  - \(C_k = \sum_{i=0}^{n-1} \sum_{j=0}^{m-1} [i + j = k] \cdot a_i b_j\)
+  - Cₖ = Σ(i=0 to n-1) Σ(j=0 to m-1) [i + j = k] · aᵢbⱼ
 - This is a double for-loop with quadratic time complexity.
 
 #### Implementation
@@ -43,18 +44,18 @@ Bonus: do the same for big numbers.
 #### Theory
 - Recursively decomposes polynomials:
   - Split each polynomial into "low" and "high" halves:
-    - \(A(x) = A_{\text{low}}(x) + A_{\text{high}}(x) \cdot x^m\)
-    - \(B(x) = B_{\text{low}}(x) + B_{\text{high}}(x) \cdot x^m\)
+    - A(x) = A_low(x) + A_high(x) · xᵐ
+    - B(x) = B_low(x) + B_high(x) · xᵐ
   - The product:
-    - \(A(x)B(x) = P_2 x^{2m} + (P_3 - P_2 - P_1)x^m + P_1\)
-      - \(P_1 = A_{\text{low}}B_{\text{low}}\)
-      - \(P_2 = A_{\text{high}}B_{\text{high}}\)
-      - \(P_3 = (A_{\text{low}} + A_{\text{high}})(B_{\text{low}} + B_{\text{high}})\)
-- This reduces multiplication from four recursive calls (classical divide and conquer) to three, improving theoretical complexity to \(O(n^{\log_2 3}) \approx O(n^{1.58})\).
+    - A(x)B(x) = P₂x²ᵐ + (P₃ - P₂ - P₁)xᵐ + P₁
+      - P₁ = A_low × B_low
+      - P₂ = A_high × B_high
+      - P₃ = (A_low + A_high) × (B_low + B_high)
+- This reduces multiplication from four recursive calls (classical divide and conquer) to three, improving theoretical complexity to O(n^(log₂3)) ≈ O(n^1.58).
 
 #### Implementation
 - **Sequential:** Pure recursive divide-and-conquer, with a cutoff to switch to the naive method for small polynomials.
-- **Parallel:** Uses std::async to perform subproblems \(P_1\) and \(P_2\) as futures, and merges when all finish. Depth limits are set to avoid thread oversubscription.
+- **Parallel:** Uses std::async to perform subproblems P₁ and P₂ as futures, and merges when all finish. Depth limits are set to avoid thread oversubscription.
 
 #### Synchronization
 - Tasks are completely independent (no shared state in recursion).
@@ -100,6 +101,12 @@ A, B);
 | Karatsuba Sequential  | 4096   | ~17.89    | 2 7 16 30 50 ...     |
 | Karatsuba Parallel    | 4096   | ~6.34     | 2 7 16 30 50 ...     |
 
+### Performance Analysis
+- **Naive Sequential → Naive Parallel:** ~3.5× speedup from parallelization
+- **Naive → Karatsuba (Sequential):** ~4.9× speedup from better algorithm
+- **Naive Sequential → Karatsuba Parallel:** ~13.7× speedup from both optimizations
+- **Karatsuba Sequential → Karatsuba Parallel:** ~2.8× speedup from parallelization
+
 ---
 
 ## Invariants and Correctness
@@ -107,7 +114,7 @@ A, B);
 - **Result Integrity:** All multiplication paths produce exactly the same output for identical input polynomials. Verified via first coefficients and optionally a checksum of the entire result.
 - **No Data Races:** All parallelism is either read-only or merged in a thread-safe manner.
 - **No Deadlocks:** Futures in Karatsuba join only independent threads.
-- **Performance is reproducible:** Use deterministic polynomial values for consistency.
+- **Performance is Reproducible:** Use deterministic polynomial values for consistency.
 
 ---
 
@@ -122,11 +129,17 @@ A, B);
 
 - **Parallel Karatsuba** offers the best scalability and performance for large degree polynomials.
 - **Parallel naive** is easy to implement and benefits from multi-core, but loses to Karatsuba asymptotically.
-- **Synchronization avoids all locks and races** by per-thread sameness and recursive independence.
+- **Synchronization avoids all locks and races** by per-thread isolation and recursive independence.
 - **Always verify both outputs and invariants** to ensure no parallelization bugs on boundary cases.
+
+### Key Takeaways
+1. Algorithm choice (O(n²) vs O(n^1.58)) matters more than parallelization for large inputs
+2. Parallelization provides additional 2-3× speedup on top of algorithmic improvements
+3. Lock-free designs with isolated state are simpler and more performant than shared-state approaches
+4. Future-based parallelism (std::async) provides clean abstractions without manual thread management
 
 ---
 
 **Author:** Antonio Hus  
 **Date:** 21.10.2025  
-**Course:** Parallel and Distributed Programming — Lab 5  
+**Course:** Parallel and Distributed Programming — Lab 5

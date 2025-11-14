@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("HttpDownloader")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7c4cbd72275cf7cfc9a798e12754b8e37230835c")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5f17dacd3e5be2be3f0d052e5dfc18fa5e2c47fa")]
 [assembly: System.Reflection.AssemblyProductAttribute("HttpDownloader")]
 [assembly: System.Reflection.AssemblyTitleAttribute("HttpDownloader")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

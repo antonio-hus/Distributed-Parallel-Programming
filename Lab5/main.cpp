@@ -193,8 +193,8 @@ static Poly multiply_karatsuba_par(const Poly& a, const Poly& b, int depth = 0) 
         futP1 = std::async(std::launch::async, multiply_karatsuba_par, a_low, b_low, depth + 1);
         futP2 = std::async(std::launch::async, multiply_karatsuba_par, a_high, b_high, depth + 1);
     } else {
-        P1 = multiply_karatsuba_par(a_low, b_low, depth + 1);
-        P2 = multiply_karatsuba_par(a_high, b_high, depth + 1);
+        P1 = multiply_karatsuba_seq(a_low, b_low);
+        P2 = multiply_karatsuba_seq(a_high, b_high);
     }
 
     Poly a_sum(std::max(a_low.size(), a_high.size()), 0);
@@ -273,8 +273,7 @@ static void benchmark(const std::string& name,
  * - Verifies output correctness by printing partial result and total sums
  */
 int main() {
-    // 4096 coefficients for benchmarking
-    const size_t n = 1 << 12;
+    const size_t n = 1 << 16;
     Poly A(n), B(n);
 
     for (size_t i = 0; i < n; ++i) {

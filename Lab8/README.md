@@ -3,24 +3,19 @@
 ## Problem Statement
 
 ### Goal
-The goal of this lab is to deal with consistency issues in distributed programming by implementing a simple distributed shared memory (DSM) that behaves sequentially consistent across multiple MPI processes.
+The goal of this lab is to deal with the consistency issues of the distributed programming.
 
 ### Requirement
-The DSM mechanism is implemented as a library plus a main program, with a predefined number of MPI processes and a predefined number of integer variables replicated on each subscribing process.
+Implement a simple distributed shared memory (DSM) mechanism. The lab shall have a main program and a DSM library. There shall be a predefined number of communicating processes. The DSM mechanism shall provide a predefined number of integer variables residing on each of the processes. The DSM shall provide the following operations:
+- Write a value to a variable (local or residing in another process);
+- A callback informing the main program that a variable managed by the DSM has changed. All processes shall receive the same sequence of data change callbacks; it is not allowed that process P sees first a change on a variable A and then a change on a variable B, while another process Q sees the change on B first and the change on A second.
+- A "compare and exchange" operation, that compares a variable with a given value and, if equal, it sets the variable to another given value. Be careful at the interaction with the previous requirement.
 
-The DSM provides the following operations:
-
-- Write a value to a variable (local or residing on another process).
-- A callback that informs the main program that a DSM-managed variable has changed, with the requirement that all processes see the same sequence of callbacks; it must not happen that process P sees change on A then on B, while process Q sees the change on B then on A.
-- A “compare and exchange” (CAS) operation that compares a variable with a given value and, if equal, sets it to another value, while still respecting the global callback ordering requirement.
-
-Notes from the lab specification:
-
-- Only nodes that subscribe to a variable receive notifications about changes of that variable and are allowed to change it.
-- Subscriptions are static; for each variable, each subscriber knows the full set of subscribers.
-- Most variables are expected to be accessed locally within a small group of processes; there must be no centralized server holding all variables, and messages related to a variable must be exchanged only between that variable’s subscribers.
-- Computers are assumed correct (no crash, no Byzantine behavior), and MPI provides reliable message passing.
-
+Notes:
+- Only nodes that subscribe to a variable will receive notifications about changes of that variable, and only those nodes are allowed to change (set) that variable;
+- The subscriptions are static and each node knows, for each variable it is subscribed to, which are the other subscribers for that variable.
+- We assume that most variables are accessed locally (within a small group of a few computers); we don't want a centralized server that hold all variables, because it would be a central bottleneck of the system. Therefore, as a result of changing a variable, all the messages should be exchanged only between the subscribers of that variable.
+- The computers are not faulty.
 ---
 
 ## Algorithms Overview
@@ -36,7 +31,7 @@ Notes from the lab specification:
   - The relation is transitively closed over the previous two.
 
 #### Implementation Strategy: Fully Distributed Lamport Total-Order Multicast
-Instead of a per-variable sequencer, the implementation uses a fully distributed totally ordered multicast based on Lamport clocks and acknowledgements:
+The implementation uses a fully distributed totally ordered multicast based on Lamport clocks and acknowledgements:
 
 - Each process maintains a Lamport clock and a priority queue of pending DSM operations, ordered by key `(timestamp, sender_rank, msg_id)`.
 - To perform a write or CAS, a process:
@@ -246,28 +241,6 @@ For a variable with subscriber set `S` of size `|S|`:
 - **Limitations:**
   - For a variable with many subscribers, the ACK-based total order produces `O(|S|^2)` message overhead per update.
   - Heavy write contention on a single variable still creates a logical bottleneck due to global ordering.
-
----
-
-## Comparison with Alternative Approaches
-
-### Centralized Server (Rejected by Lab)
-
-- One process holds all variables and all operations go through it.
-- Violates the lab requirement of avoiding a central bottleneck and limiting messages to subscribers of each variable.
-- Poor scalability, single point of failure, and higher latency for remote reads.
-
-### Per-Variable Sequencer (Previous Approach)
-
-- Each variable has one sequencer (e.g., lowest-rank subscriber) that orders all operations on that variable and broadcasts updates.
-- Simpler protocol, but still introduces a designated bottleneck per variable (the sequencer).
-- Was the first implementation, but replaced with a fully symmetric protocol in this version.
-
-### Fully Distributed Total-Order Multicast (Current Approach)
-
-- No dedicated sequencer; all subscribers run the same algorithm and cooperate to implement total order.
-- Uses Lamport timestamps and ACKs to ensure the same global delivery order at all subscribers.
-- Satisfies the lab’s non-centralization and “subscribers-only” communication constraints while still giving sequential consistency and atomic CAS.
 
 ---
 

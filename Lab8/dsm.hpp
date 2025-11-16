@@ -6,67 +6,95 @@
 #include <set>
 #include <vector>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <algorithm>
-#include <string>
 #include <queue>
 
 /**
- * Enhanced DSM Implementation with Lamport Logical Clocks (Lecture 10)
+ * Distributed Shared Memory (DSM) with Lamport Totally-Ordered Multicast (no sequencer).
  *
- * Sequential Consistency achieved via:
- * 1. Each variable has a sequencer (lowest rank subscriber)
- * 2. Sequencer assigns Lamport timestamps to all updates
- * 3. MPI FIFO guarantees ordered delivery from sequencer
- * 4. Priority queue applies updates in timestamp order
- * 5. Result: All processes see identical update sequences
+ * - Each process keeps a Lamport logical clock.
+ * - A write or CAS is multicast to all subscribers of that variable with a (timestamp, sender, msg_id).
+ * - All processes insert received messages into a priority queue ordered by (timestamp, sender, msg_id).
+ * - Each process sends ACKs; a message is DELIVERED only when all subscribers have ACKed it
+ *   and it is at the head of the queue.
+ * - This yields the same global total order of updates (writes + CAS) on all subscribers,
+ *   satisfying the lab requirement that all processes see the same callback sequence.
  */
 
 enum class MessageType {
-    WRITE_REQUEST = 1,
-    UPDATE = 2,
-    CAS_REQUEST = 3,
-    CAS_RESPONSE = 4
+    UPDATE = 1,  // simple write(var, new_value)
+    CAS    = 2,  // compareAndSwap(var, expected, new_value)
+    ACK    = 3   // acknowledgement for total-order multicast
 };
 
 class DistributedSharedMemory {
 public:
-    using ChangeCallback = std::function<void(int variable_id, int old_value, int new_value, int lamport_time)>;
+    using ChangeCallback =
+            std::function<void(int variable_id, int old_value, int new_value, int lamport_time)>;
 
 private:
     int rank_;
     int world_size_;
     bool verbose_;
 
-    // Lamport logical clock - implements happens-before ordering (Lecture 10)
+    // Lamport logical clock
     int lamport_clock_;
 
+    // Per-process local copy of DSM variables
     std::map<int, int> variables_;
+
+    // Static subscription sets: variable_id -> set of ranks
     std::map<int, std::set<int>> subscriptions_;
+
     ChangeCallback change_callback_;
 
-    // Priority queue for ordered update processing
-    struct PendingUpdate {
-        int lamport_time;
-        int variable_id;
-        int old_value;
-        int new_value;
+    // Per-process monotonically increasing ID for DSM messages
+    int next_message_id_;
 
-        bool operator>(const PendingUpdate& other) const {
-            if (lamport_time != other.lamport_time) {
-                return lamport_time > other.lamport_time;
+    // Pending DSM operations waiting for total-order delivery
+    struct PendingMessage {
+        int timestamp;      // Lamport timestamp assigned at send
+        int sender;         // original sender rank
+        int msg_id;         // per-sender unique id
+        MessageType type;   // UPDATE or CAS
+        int var_id;
+        int new_value;      // for UPDATE and CAS
+        int expected;       // for CAS; ignored for UPDATE
+    };
+
+    struct PendingCompare {
+        bool operator()(const PendingMessage& a, const PendingMessage& b) const {
+            if (a.timestamp != b.timestamp) {
+                return a.timestamp > b.timestamp; // min-heap by timestamp
             }
-            return variable_id > other.variable_id;
+            if (a.sender != b.sender) {
+                return a.sender > b.sender;       // tie-break by rank
+            }
+            return a.msg_id > b.msg_id;           // tie-break by local message id
         }
     };
 
-    std::priority_queue<PendingUpdate, std::vector<PendingUpdate>, std::greater<PendingUpdate>> pending_updates_;
+    std::priority_queue<PendingMessage,
+            std::vector<PendingMessage>,
+            PendingCompare> pending_messages_;
+
+    // For each (sender,msg_id) we track the ranks that have seen the message
+    // (origin is always implicitly considered to have seen it)
+    std::map<std::pair<int,int>, std::set<int>> ack_sets_;
+
+    // CAS result tracking for the originating process
+    std::map<std::pair<int,int>, bool> cas_result_;
+    std::map<std::pair<int,int>, bool> cas_done_;
 
 public:
     DistributedSharedMemory(int rank, int world_size, bool verbose = false)
-            : rank_(rank), world_size_(world_size), verbose_(verbose), lamport_clock_(0) {
-        if (verbose_) log("DSM initialized with Lamport clock at 0");
+            : rank_(rank),
+              world_size_(world_size),
+              verbose_(verbose),
+              lamport_clock_(0),
+              next_message_id_(0) {
+        if (verbose_) log("DSM initialized (no sequencer, Lamport total order)");
     }
 
     void subscribe(int variable_id, const std::set<int>& subscriber_ranks) {
@@ -76,8 +104,10 @@ public:
         subscriptions_[variable_id] = subscriber_ranks;
         variables_[variable_id] = 0;
         incrementClock();
-        if (verbose_) log("Subscribed to variable " + std::to_string(variable_id) +
-                          " | Clock: " + std::to_string(lamport_clock_));
+        if (verbose_) {
+            log("Subscribed to variable " + std::to_string(variable_id) +
+                " | Clock=" + std::to_string(lamport_clock_));
+        }
     }
 
     void setChangeCallback(ChangeCallback callback) {
@@ -85,93 +115,180 @@ public:
     }
 
     int read(int variable_id) {
-        if (variables_.find(variable_id) == variables_.end()) {
+        auto it = variables_.find(variable_id);
+        if (it == variables_.end()) {
             throw std::runtime_error("Variable not subscribed or found.");
         }
         incrementClock();
-        return variables_.at(variable_id);
+        return it->second;
     }
 
+    // Simple write: totally ordered multicast to all subscribers of the variable
     void write(int variable_id, int new_value) {
-        incrementClock(); // Local event
+        ensureSubscribed(variable_id);
 
-        int sequencer = getSequencer(variable_id);
+        incrementClock();
+        int timestamp = lamport_clock_;
+        int msg_id = next_message_id_++;
+
+        PendingMessage msg{
+                timestamp,
+                rank_,
+                msg_id,
+                MessageType::UPDATE,
+                variable_id,
+                new_value,
+                0 // expected not used for UPDATE
+        };
+
+        // Insert locally into pending queue
+        pending_messages_.push(msg);
+
+        // Origin has trivially seen its own message
+        auto key = std::make_pair(rank_, msg_id);
+        ack_sets_[key].insert(rank_);
+
+        // Multicast to all other subscribers of this variable
+        const auto& subscribers = subscriptions_.at(variable_id);
         std::vector<int> buffer = {
-                (int)MessageType::WRITE_REQUEST,
+                (int)MessageType::UPDATE,
                 variable_id,
                 new_value,
-                lamport_clock_ // Include Lamport timestamp
+                0,             // expected unused
+                rank_,         // original sender
+                msg_id,
+                timestamp
         };
 
-        if (sequencer == rank_) {
-            if (verbose_) log("Handling WRITE locally | T=" + std::to_string(lamport_clock_));
-            handleWriteRequest(buffer, rank_);
-        } else {
-            if (verbose_) log("WRITE var " + std::to_string(variable_id) +
-                              " -> sequencer " + std::to_string(sequencer) +
-                              " | T=" + std::to_string(lamport_clock_));
-            MPI_Send(buffer.data(), buffer.size(), MPI_INT, sequencer, 0, MPI_COMM_WORLD);
+        for (int dest : subscribers) {
+            if (dest == rank_) continue; // local already added
+            MPI_Send(buffer.data(), (int)buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
+        }
+
+        if (verbose_) {
+            log("WRITE var " + std::to_string(variable_id) +
+                " = " + std::to_string(new_value) +
+                " | T=" + std::to_string(timestamp));
         }
     }
 
+    // CAS: totally ordered, returns success/failure after the CAS is globally ordered and applied
     bool compareAndSwap(int variable_id, int expected, int new_value) {
-        incrementClock(); // Local event
+        ensureSubscribed(variable_id);
 
-        int sequencer = getSequencer(variable_id);
-        std::vector<int> request_buf = {
-                (int)MessageType::CAS_REQUEST,
+        incrementClock();
+        int timestamp = lamport_clock_;
+        int msg_id = next_message_id_++;
+
+        PendingMessage msg{
+                timestamp,
+                rank_,
+                msg_id,
+                MessageType::CAS,
                 variable_id,
-                expected,
                 new_value,
-                lamport_clock_
+                expected
         };
 
-        if (sequencer == rank_) {
-            if (verbose_) log("Handling CAS locally | T=" + std::to_string(lamport_clock_));
-            return handleCasRequest(request_buf, rank_);
-        } else {
-            if (verbose_) log("CAS var " + std::to_string(variable_id) +
-                              " -> sequencer " + std::to_string(sequencer) +
-                              " | T=" + std::to_string(lamport_clock_));
-            MPI_Send(request_buf.data(), request_buf.size(), MPI_INT, sequencer, 0, MPI_COMM_WORLD);
+        // Insert locally into pending queue
+        pending_messages_.push(msg);
 
-            // Use tag=1 to distinguish CAS response from regular messages
-            int success_response;
-            MPI_Recv(&success_response, 1, MPI_INT, sequencer, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            incrementClock();
-            if (verbose_) log("CAS response: " + std::string(success_response ? "SUCCESS" : "FAILED") +
-                              " | T=" + std::to_string(lamport_clock_));
-            return success_response;
+        auto key = std::make_pair(rank_, msg_id);
+        ack_sets_[key].insert(rank_);  // origin has seen its own message
+
+        // Mark CAS as not yet decided
+        cas_done_[key] = false;
+        cas_result_[key] = false;
+
+        // Multicast CAS to all other subscribers
+        const auto& subscribers = subscriptions_.at(variable_id);
+        std::vector<int> buffer = {
+                (int)MessageType::CAS,
+                variable_id,
+                new_value,
+                expected,
+                rank_,     // original sender
+                msg_id,
+                timestamp
+        };
+
+        for (int dest : subscribers) {
+            if (dest == rank_) continue;
+            MPI_Send(buffer.data(), (int)buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
         }
+
+        if (verbose_) {
+            log("CAS request var " + std::to_string(variable_id) +
+                " expected=" + std::to_string(expected) +
+                " new=" + std::to_string(new_value) +
+                " | T=" + std::to_string(timestamp));
+        }
+
+        // Wait until this CAS is delivered in total order and decided
+        while (!cas_done_[key]) {
+            processMessages();
+        }
+
+        bool success = cas_result_[key];
+        cas_done_.erase(key);
+        cas_result_.erase(key);
+
+        if (verbose_) {
+            log(std::string("CAS result var ") + std::to_string(variable_id) +
+                " -> " + (success ? "SUCCESS" : "FAILED"));
+        }
+
+        return success;
     }
 
+    // Must be called periodically by the main program to receive and deliver messages
     void processMessages() {
         int flag = 0;
         MPI_Status status;
-        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
 
+        // Receive all currently available messages
+        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
         while (flag) {
-            int count;
+            int count = 0;
             MPI_Get_count(&status, MPI_INT, &count);
             std::vector<int> buffer(count);
-            MPI_Recv(buffer.data(), count, MPI_INT, status.MPI_SOURCE, status.MPI_TAG,
+
+            MPI_Recv(buffer.data(), count, MPI_INT,
+                     status.MPI_SOURCE, status.MPI_TAG,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            // Update Lamport clock on message receipt (Lecture 10)
-            if (buffer.size() >= 4) {
-                int message_timestamp = buffer[buffer.size() - 1];
-                lamport_clock_ = std::max(lamport_clock_, message_timestamp) + 1;
-            } else {
-                incrementClock();
+            MessageType type = (MessageType)buffer[0];
+            int var_id       = buffer[1];
+            int new_value    = buffer[2];
+            int expected     = buffer[3];
+            int original_sender = buffer[4];
+            int msg_id       = buffer[5];
+            int msg_timestamp = buffer[6];
+
+            // Update Lamport clock on receive
+            lamport_clock_ = std::max(lamport_clock_, msg_timestamp) + 1;
+
+            if (type == MessageType::UPDATE || type == MessageType::CAS) {
+                handleDsmMessage(type,
+                                 var_id,
+                                 new_value,
+                                 expected,
+                                 original_sender,
+                                 msg_id,
+                                 msg_timestamp);
+            } else if (type == MessageType::ACK) {
+                handleAckMessage(var_id,
+                                 original_sender,
+                                 msg_id,
+                                 status.MPI_SOURCE);
             }
 
-            handleMessage(buffer, status.MPI_SOURCE);
-
-            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
+            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG,
+                       MPI_COMM_WORLD, &flag, &status);
         }
 
-        // Process pending updates in timestamp order
-        processPendingUpdates();
+        // Try to deliver messages in total order
+        deliverPendingMessages();
     }
 
     int getLamportClock() const {
@@ -183,134 +300,180 @@ private:
         lamport_clock_++;
     }
 
-    int getSequencer(int variable_id) {
-        const auto& subscribers = subscriptions_.at(variable_id);
-        if (subscribers.empty()) throw std::runtime_error("No subscribers for variable");
-        return *subscribers.begin();
-    }
-
-    void handleMessage(const std::vector<int>& buffer, int source_rank) {
-        MessageType type = (MessageType)buffer[0];
-        switch (type) {
-            case MessageType::WRITE_REQUEST: handleWriteRequest(buffer, source_rank); break;
-            case MessageType::UPDATE: handleUpdate(buffer); break;
-            case MessageType::CAS_REQUEST: handleCasRequest(buffer, source_rank); break;
-            case MessageType::CAS_RESPONSE: break;
+    void ensureSubscribed(int variable_id) const {
+        auto it = subscriptions_.find(variable_id);
+        if (it == subscriptions_.end() ||
+            it->second.find(rank_) == it->second.end()) {
+            throw std::runtime_error("Process not subscribed to this variable.");
         }
     }
 
-    void handleWriteRequest(const std::vector<int>& buffer, int source_rank) {
-        int var_id = buffer[1];
-        int new_val = buffer[2];
-        int request_time = buffer[3];
+    void handleDsmMessage(MessageType type,
+                          int var_id,
+                          int new_value,
+                          int expected,
+                          int original_sender,
+                          int msg_id,
+                          int msg_timestamp) {
+        // Ignore messages for variables this process does not know about
+        auto subs_it = subscriptions_.find(var_id);
+        if (subs_it == subscriptions_.end()) {
+            return;
+        }
 
-        incrementClock();
-
-        if (verbose_) log("Sequencer: WRITE from " + std::to_string(source_rank) +
-                          " | ReqT=" + std::to_string(request_time) +
-                          " | CurT=" + std::to_string(lamport_clock_));
-
-        int old_val = variables_[var_id];
-        std::vector<int> update_buf = {
-                (int)MessageType::UPDATE,
+        PendingMessage msg{
+                msg_timestamp,
+                original_sender,
+                msg_id,
+                type,
                 var_id,
-                old_val,
-                new_val,
-                lamport_clock_ // Sequencer's timestamp
+                new_value,
+                expected
         };
 
-        const auto& subscribers = subscriptions_.at(var_id);
-        for (int dest_rank : subscribers) {
-            if (dest_rank == rank_) {
-                handleUpdate(update_buf);
-            } else {
-                MPI_Send(update_buf.data(), update_buf.size(), MPI_INT, dest_rank, 0, MPI_COMM_WORLD);
-            }
+        pending_messages_.push(msg);
+
+        auto key = std::make_pair(original_sender, msg_id);
+        auto& ack_set = ack_sets_[key];
+
+        // Origin has trivially seen the message
+        ack_set.insert(original_sender);
+        // This receiver has now seen it
+        ack_set.insert(rank_);
+
+        // Send ACK to all subscribers of this variable
+        const auto& subscribers = subs_it->second;
+        std::vector<int> ack_buffer = {
+                (int)MessageType::ACK,
+                var_id,
+                0,          // unused
+                0,          // unused
+                original_sender,
+                msg_id,
+                lamport_clock_
+        };
+
+        for (int dest : subscribers) {
+            if (dest == rank_) continue;
+            MPI_Send(ack_buffer.data(), (int)ack_buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
+        }
+
+        if (verbose_) {
+            log("Received DSM msg type=" + std::to_string((int)type) +
+                " var=" + std::to_string(var_id) +
+                " from " + std::to_string(original_sender) +
+                " msg_id=" + std::to_string(msg_id) +
+                " | T=" + std::to_string(msg_timestamp));
         }
     }
 
-    bool handleCasRequest(const std::vector<int>& buffer, int source_rank) {
-        int var_id = buffer[1];
-        int expected = buffer[2];
-        int new_val = buffer[3];
-        int request_time = buffer[4];
+    void handleAckMessage(int var_id,
+                          int original_sender,
+                          int msg_id,
+                          int ack_sender) {
+        auto subs_it = subscriptions_.find(var_id);
+        if (subs_it == subscriptions_.end()) {
+            return;
+        }
 
-        incrementClock();
+        auto key = std::make_pair(original_sender, msg_id);
+        auto& ack_set = ack_sets_[key];
 
-        if (verbose_) log("Sequencer: CAS from " + std::to_string(source_rank) +
-                          " | Expected=" + std::to_string(expected) +
-                          " | Current=" + std::to_string(variables_[var_id]) +
-                          " | ReqT=" + std::to_string(request_time) +
-                          " | CurT=" + std::to_string(lamport_clock_));
+        // Origin always considered to have seen the message
+        ack_set.insert(original_sender);
+        // The sender of this ACK has seen it
+        ack_set.insert(ack_sender);
 
-        bool success = false;
-        if (variables_[var_id] == expected) {
-            success = true;
-            int old_val = variables_[var_id];
+        if (verbose_) {
+            log("ACK for msg (" + std::to_string(original_sender) +
+                "," + std::to_string(msg_id) +
+                ") from " + std::to_string(ack_sender));
+        }
+    }
 
-            // UPDATE LOCAL STATE IMMEDIATELY (sequencer applies its own update)
-            variables_[var_id] = new_val;
+    bool haveAllAcks(const PendingMessage& msg) const {
+        auto subs_it = subscriptions_.find(msg.var_id);
+        if (subs_it == subscriptions_.end()) return false;
 
-            std::vector<int> update_buf = {
-                    (int)MessageType::UPDATE,
-                    var_id,
-                    old_val,
-                    new_val,
-                    lamport_clock_
-            };
+        auto key = std::make_pair(msg.sender, msg.msg_id);
+        auto ack_it = ack_sets_.find(key);
+        if (ack_it == ack_sets_.end()) return false;
 
-            const auto& subscribers = subscriptions_.at(var_id);
-            for (int dest_rank : subscribers) {
-                if (dest_rank != rank_) {  // Don't send to self since we already updated
-                    MPI_Send(update_buf.data(), update_buf.size(), MPI_INT, dest_rank, 0, MPI_COMM_WORLD);
+        const auto& subscribers = subs_it->second;
+        const auto& ack_set = ack_it->second;
+
+        for (int r : subscribers) {
+            if (ack_set.find(r) == ack_set.end()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void deliverPendingMessages() {
+        bool delivered = true;
+
+        // Keep delivering while the top message is deliverable
+        while (delivered && !pending_messages_.empty()) {
+            delivered = false;
+            const PendingMessage& top = pending_messages_.top();
+
+            if (!haveAllAcks(top)) {
+                // Cannot yet deliver; some subscribers did not ACK
+                break;
+            }
+
+            PendingMessage msg = top;
+            pending_messages_.pop();
+            delivered = true;
+
+            int old_val = variables_[msg.var_id];
+            bool cas_success = false;
+
+            if (msg.type == MessageType::UPDATE) {
+                variables_[msg.var_id] = msg.new_value;
+                if (verbose_) {
+                    log("DELIVER UPDATE var " + std::to_string(msg.var_id) +
+                        ": " + std::to_string(old_val) +
+                        " -> " + std::to_string(msg.new_value) +
+                        " | T=" + std::to_string(msg.timestamp));
+                }
+                if (change_callback_) {
+                    change_callback_(msg.var_id, old_val, msg.new_value, msg.timestamp);
+                }
+            } else if (msg.type == MessageType::CAS) {
+                if (variables_[msg.var_id] == msg.expected) {
+                    variables_[msg.var_id] = msg.new_value;
+                    cas_success = true;
+                    if (verbose_) {
+                        log("DELIVER CAS SUCCESS var " + std::to_string(msg.var_id) +
+                            ": " + std::to_string(old_val) +
+                            " -> " + std::to_string(msg.new_value) +
+                            " | T=" + std::to_string(msg.timestamp));
+                    }
+                    if (change_callback_) {
+                        change_callback_(msg.var_id, old_val, msg.new_value, msg.timestamp);
+                    }
+                } else {
+                    if (verbose_) {
+                        log("DELIVER CAS FAIL var " + std::to_string(msg.var_id) +
+                            " expected=" + std::to_string(msg.expected) +
+                            " current=" + std::to_string(old_val) +
+                            " | T=" + std::to_string(msg.timestamp));
+                    }
+                }
+
+                // If this process originated the CAS, record the result
+                if (msg.sender == rank_) {
+                    auto key = std::make_pair(msg.sender, msg.msg_id);
+                    cas_result_[key] = cas_success;
+                    cas_done_[key] = true;
                 }
             }
-
-            // Trigger callback for sequencer
-            if (change_callback_) {
-                change_callback_(var_id, old_val, new_val, lamport_clock_);
-            }
-        }
-
-        int response = success ? 1 : 0;
-        if (source_rank != rank_) {
-            MPI_Send(&response, 1, MPI_INT, source_rank, 1, MPI_COMM_WORLD);
-        }
-        return success;
-    }
-
-
-
-    void handleUpdate(const std::vector<int>& buffer) {
-        int var_id = buffer[1];
-        int old_val = buffer[2];
-        int new_val = buffer[3];
-        int update_time = buffer[4];
-
-        // Queue for ordered processing
-        pending_updates_.push({update_time, var_id, old_val, new_val});
-    }
-
-    void processPendingUpdates() {
-        while (!pending_updates_.empty()) {
-            auto update = pending_updates_.top();
-            pending_updates_.pop();
-
-            int local_old_val = variables_[update.variable_id];
-            variables_[update.variable_id] = update.new_value;
-
-            if (verbose_) log("Applied UPDATE var " + std::to_string(update.variable_id) +
-                              " | T=" + std::to_string(update.lamport_time) +
-                              " | " + std::to_string(local_old_val) + " -> " +
-                              std::to_string(update.new_value));
-
-            if (change_callback_) {
-                change_callback_(update.variable_id, local_old_val, update.new_value, update.lamport_time);
-            }
         }
     }
 
-    void log(const std::string& message) {
+    void log(const std::string& message) const {
         std::cout << "[Rank " << rank_ << "] " << message << std::endl;
     }
 };

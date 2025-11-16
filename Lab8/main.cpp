@@ -18,6 +18,7 @@ std::vector<EventLog> event_sequence;
 void runScenario1(DistributedSharedMemory& dsm, int rank) {
     std::cout << "[Rank " << rank << "] === Scenario 1: Sequential Consistency ===\n";
 
+    // All ranks subscribe to var 0; ranks 0,1,2 write it to create contention
     if (rank == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         dsm.write(0, 100);
@@ -38,22 +39,26 @@ void runScenario1(DistributedSharedMemory& dsm, int rank) {
 }
 
 void runScenario2(DistributedSharedMemory& dsm, int rank) {
-    std::cout << "[Rank " << rank << "] === Scenario 2: Multiple Variables ===\n";
+    std::cout << "[Rank " << rank << "] === Scenario 2: Multiple Variables & Local Groups ===\n";
+
+    // var 1: all ranks subscribe and can write.
+    // var 2: only ranks {0,2,3} subscribe and are allowed to write it.
 
     if (rank == 0) {
         dsm.write(1, 10);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        dsm.write(2, 20);
+        dsm.write(2, 20);   // allowed (rank 0 subscribes to var 2)
     } else if (rank == 1) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         dsm.write(1, 15);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        dsm.write(2, 25);
+        // rank 1 does NOT write var 2, to respect subscription set
     } else if (rank == 2) {
         std::this_thread::sleep_for(std::chrono::milliseconds(75));
         dsm.write(1, 12);
-        dsm.write(2, 22);
+        dsm.write(2, 22);   // allowed (rank 2 subscribes to var 2)
     }
+    // rank 3 does not write, but sees all changes it subscribes to
 
     for (int i = 0; i < 15; ++i) {
         dsm.processMessages();
@@ -109,8 +114,20 @@ void runScenario4(DistributedSharedMemory& dsm, int rank) {
     }
 }
 
+// Only variables 0,1,3,4 are subscribed by all processes; 2 is local-group only.
+static bool is_globally_shared_var(int var_id) {
+    return var_id == 0 || var_id == 1 || var_id == 3 || var_id == 4;
+}
+
 void verifySequentialConsistency(int rank, int world_size) {
-    int local_event_count = event_sequence.size();
+    // Count only callbacks for globally shared variables (0,1,3,4)
+    int local_event_count = 0;
+    for (const auto& e : event_sequence) {
+        if (is_globally_shared_var(e.variable_id)) {
+            local_event_count++;
+        }
+    }
+
     std::vector<int> all_counts(world_size);
 
     MPI_Gather(&local_event_count, 1, MPI_INT,
@@ -120,7 +137,7 @@ void verifySequentialConsistency(int rank, int world_size) {
         std::cout << "\n========================================\n";
         std::cout << "SEQUENTIAL CONSISTENCY VERIFICATION\n";
         std::cout << "========================================\n";
-        std::cout << "Event counts per process:\n";
+        std::cout << "Event counts per process (vars 0,1,3,4 only):\n";
         for (int i = 0; i < world_size; ++i) {
             std::cout << "  Rank " << i << ": " << all_counts[i] << " events\n";
         }
@@ -136,10 +153,12 @@ void verifySequentialConsistency(int rank, int world_size) {
         std::cout << " Consistency: "
                   << (consistent ? "PASSED" : "FAILED") << "\n";
 
-        std::cout << "\nEvent sequence (by Lamport timestamp):\n";
+        std::cout << "\nEvent sequence on Rank 0 (vars 0,1,3,4):\n";
         for (const auto& e : event_sequence) {
+            if (!is_globally_shared_var(e.variable_id)) continue;
             std::cout << "  [T=" << e.lamport_time << "] Var " << e.variable_id
-                      << ": " << e.old_value << " -> " << e.new_value << "\n";
+                      << ": " << e.old_value << " -> " << e.new_value
+                      << " (rank " << e.rank << ")\n";
         }
     }
 }
@@ -160,16 +179,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    DistributedSharedMemory dsm(rank, world_size, true);
+    // For submission, verbose=false to keep output clean; set true while debugging if needed.
+    DistributedSharedMemory dsm(rank, world_size, /*verbose=*/false);
 
+    // Subscription sets:
+    //   - var 0,1,3,4: all ranks subscribe.
+    //   - var 2: only ranks {0,2,3} subscribe, to illustrate local groups.
     std::set<int> all_processes;
     for (int i = 0; i < world_size; ++i) {
         all_processes.insert(i);
     }
 
-    for (int var = 0; var <= 4; ++var) {
-        dsm.subscribe(var, all_processes);
+    std::set<int> subs_var2 = {0, 2, 3};
+
+    dsm.subscribe(0, all_processes);
+    dsm.subscribe(1, all_processes);
+    if (subs_var2.count(rank) != 0) {
+        dsm.subscribe(2, subs_var2);   // only ranks 0,2,3 subscribe to var 2
     }
+    dsm.subscribe(3, all_processes);
+    dsm.subscribe(4, all_processes);
 
     dsm.setChangeCallback([rank](int var_id, int old_val, int new_val, int lamport_time) {
         std::cout << "[Rank " << rank << "] CALLBACK: Var " << var_id
@@ -182,12 +211,10 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         std::cout << "\n=============================================\n";
-        std::cout << "DISTRIBUTED SHARED MEMORY WITH LAMPORT CLOCKS\n";
-        std::cout << "=============================================\n";
+        std::cout << "DISTRIBUTED SHARED MEMORY (NO SEQUENCER)\n";
+        std::cout << "Lamport total-order multicast\n";
         std::cout << "Processes: " << world_size << "\n";
         std::cout << "Variables: 0-4\n";
-        std::cout << "Protocol: Sequencer with Lamport timestamps\n";
-        std::cout << "Consistency: Sequential (Lecture 10)\n";
         std::cout << "=============================================\n\n";
     }
 
@@ -211,6 +238,7 @@ int main(int argc, char** argv) {
         std::cout << "\n========================================\n";
         std::cout << "Final Values (Rank 0):\n";
         for (int i = 0; i <= 4; ++i) {
+            // read() also advances the clock but that's fine for a final print.
             std::cout << "  Variable " << i << ": " << dsm.read(i) << "\n";
         }
         std::cout << "  Lamport Clock: " << dsm.getLamportClock() << "\n";

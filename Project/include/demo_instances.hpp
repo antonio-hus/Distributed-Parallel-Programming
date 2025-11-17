@@ -1,0 +1,18 @@
+#pragma once
+
+///////////////////////////
+///       IMPORTS       ///
+///////////////////////////
+#include "model.hpp"
+
+
+///////////////////////////
+///     DEMO SIZES      ///
+///////////////////////////
+enum class DemoSize { XS, S, M, L, XL, XXL, XXXL };
+
+
+///////////////////////////
+///    DEMO FACTORY     ///
+///////////////////////////
+ProblemInstance makeDemoInstance(DemoSize size);

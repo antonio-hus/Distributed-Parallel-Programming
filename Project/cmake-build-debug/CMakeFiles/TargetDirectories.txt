@@ -1,0 +1,6 @@
+C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug/CMakeFiles/timetable_seq.dir
+C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug/CMakeFiles/timetable_thr.dir
+C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug/CMakeFiles/timetable_mpi.dir
+C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug/CMakeFiles/timetable_ocl.dir
+C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug/CMakeFiles/edit_cache.dir
+C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug/CMakeFiles/rebuild_cache.dir

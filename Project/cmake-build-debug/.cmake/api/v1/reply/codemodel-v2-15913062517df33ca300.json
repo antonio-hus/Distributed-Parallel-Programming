@@ -1,0 +1,87 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Debug-d0094a50bb2071803777.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.15"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "Timetabling",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "timetable_mpi::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-timetable_mpi-Debug-6f49e5cb588ff90170a2.json",
+					"name" : "timetable_mpi",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "timetable_ocl::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-timetable_ocl-Debug-0808d76648e7f376a842.json",
+					"name" : "timetable_ocl",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "timetable_seq::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-timetable_seq-Debug-7828e625c9fcf601a089.json",
+					"name" : "timetable_seq",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "timetable_thr::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-timetable_thr-Debug-6a86c24841fb9ae818c8.json",
+					"name" : "timetable_thr",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project/cmake-build-debug",
+		"source" : "C:/Users/anton/OneDrive/Documents/GitHub/Parallel-Distributed-Programming/Project"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 6
+	}
+}

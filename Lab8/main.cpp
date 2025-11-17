@@ -15,6 +15,14 @@ struct EventLog {
 
 std::vector<EventLog> event_sequence;
 
+// Simple helper: drive DSM protocol for a bit
+void flushMessages(DistributedSharedMemory& dsm, int rounds = 15, int sleep_ms = 50) {
+    for (int i = 0; i < rounds; ++i) {
+        dsm.processMessages();
+        if (sleep_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    }
+}
+
 void runScenario1(DistributedSharedMemory& dsm, int rank) {
     std::cout << "[Rank " << rank << "] === Scenario 1: Sequential Consistency ===\n";
 
@@ -32,10 +40,8 @@ void runScenario1(DistributedSharedMemory& dsm, int rank) {
         dsm.write(0, 120);
     }
 
-    for (int i = 0; i < 15; ++i) {
-        dsm.processMessages();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    // Let DSM protocol run to completion for this scenario
+    flushMessages(dsm);
 }
 
 void runScenario2(DistributedSharedMemory& dsm, int rank) {
@@ -60,10 +66,7 @@ void runScenario2(DistributedSharedMemory& dsm, int rank) {
     }
     // rank 3 does not write, but sees all changes it subscribes to
 
-    for (int i = 0; i < 15; ++i) {
-        dsm.processMessages();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    flushMessages(dsm);
 }
 
 void runScenario3(DistributedSharedMemory& dsm, int rank) {
@@ -74,10 +77,7 @@ void runScenario3(DistributedSharedMemory& dsm, int rank) {
     std::cout << "[Rank " << rank << "] CAS(3, 0, " << (rank * 10)
               << ") = " << (success ? "SUCCESS" : "FAILED") << "\n";
 
-    for (int i = 0; i < 10; ++i) {
-        dsm.processMessages();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    flushMessages(dsm);
 
     if (rank == 0) {
         int current_value = dsm.read(3);
@@ -87,10 +87,7 @@ void runScenario3(DistributedSharedMemory& dsm, int rank) {
                   << ", 999) = " << (success ? "SUCCESS" : "FAILED") << "\n";
     }
 
-    for (int i = 0; i < 10; ++i) {
-        dsm.processMessages();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    flushMessages(dsm);
 }
 
 void runScenario4(DistributedSharedMemory& dsm, int rank) {
@@ -108,10 +105,7 @@ void runScenario4(DistributedSharedMemory& dsm, int rank) {
         std::cout << "[Rank 1] Event C: write(4, 3) | Clock=" << dsm.getLamportClock() << "\n";
     }
 
-    for (int i = 0; i < 15; ++i) {
-        dsm.processMessages();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    flushMessages(dsm);
 }
 
 // Only variables 0,1,3,4 are subscribed by all processes; 2 is local-group only.
@@ -137,7 +131,7 @@ void verifySequentialConsistency(int rank, int world_size) {
         std::cout << "\n========================================\n";
         std::cout << "SEQUENTIAL CONSISTENCY VERIFICATION\n";
         std::cout << "========================================\n";
-        std::cout << "Event counts per process (vars 0,1,3,4 only):\n";
+        std::cout << "Event counts per process:\n";
         for (int i = 0; i < world_size; ++i) {
             std::cout << "  Rank " << i << ": " << all_counts[i] << " events\n";
         }

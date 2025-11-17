@@ -11,7 +11,7 @@
 #include <queue>
 
 /**
- * Distributed Shared Memory (DSM) with Lamport Totally-Ordered Multicast (no sequencer).
+ * Distributed Shared Memory (DSM) with Lamport Totally-Ordered Multicast.
  *
  * - Each process keeps a Lamport logical clock.
  * - A write or CAS is multicast to all subscribers of that variable with a (timestamp, sender, msg_id).

@@ -6,7 +6,7 @@
 #include "demo_instances.hpp"
 #include "opencl_solver.hpp"
 #include <iostream>
-
+#include <chrono>
 
 ///////////////////////////
 ///     ENTRY POINT     ///
@@ -14,7 +14,7 @@
 /**
  * @brief Demo entry point for the OpenCL-based exhaustive timetabling solver.
  *
- * Builds a large demo instance, runs the CPU DFS + GPU scoring pipeline,
+ * Builds a demo instance, runs the CPU DFS + GPU scoring pipeline,
  * and prints the best timetable score and per-group schedules if a solution
  * is found.
  */
@@ -23,15 +23,15 @@ int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    // Use an extra-large demo to showcase GPU acceleration.
-    DemoSize size = DemoSize::M;
+    // Choose which demo problem size to run.
+    DemoSize size = DemoSize::XXL;
     ProblemInstance inst = makeDemoInstance(size);
 
     // Configuration for the exhaustive search.
     //  - maxSolutions: upper bound on how many complete timetables to generate.
     //  - batchSize:    how many candidates to score per GPU batch.
-    int maxSolutions = 1000000;
-    int batchSize = 512;
+    int maxSolutions = 1;
+    int batchSize    = 512;
 
     std::cout << "========================================\n";
     std::cout << "OPENCL EXHAUSTIVE TIMETABLING SOLVER\n";
@@ -39,9 +39,15 @@ int main(int argc, char** argv) {
     std::cout << "GPU batch size: " << batchSize << "\n";
     std::cout << "========================================\n";
 
-    // Create and run the OpenCL-based exhaustive solver.
     OpenCLExhaustiveSolver solver(maxSolutions, batchSize);
+
+    // Measure wall-clock time for the OpenCL solver.
+    auto start = std::chrono::high_resolution_clock::now();
     auto solOpt = solver.solve(inst);
+    auto end   = std::chrono::high_resolution_clock::now();
+    double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "OpenCL solver time: " << elapsedMs << " ms\n";
 
     // Print result summary and, if available, detailed group schedules.
     if (!solOpt) {

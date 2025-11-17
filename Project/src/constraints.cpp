@@ -121,7 +121,7 @@ bool TimetableState::checkFinalWorkloadBounds() const {
     int numProfs = (int)inst_.professors.size();
     for (int i = 0; i < numProfs; ++i) {
         int hours = profHours_[i];
-        if (hours < 4 || hours > 40) {
+        if (hours < 4 || hours > 80) {
             return false;
         }
     }
@@ -245,7 +245,7 @@ bool TimetableState::checkTravelTimes(const Activity& act, int day, int slot, in
  */
 bool TimetableState::checkProfWorkloadLocal(int profIndex) const {
     int hours = profHours_[profIndex];
-    if (hours > 40) return false;
+    if (hours > 80) return false;
     return true;
 }
 

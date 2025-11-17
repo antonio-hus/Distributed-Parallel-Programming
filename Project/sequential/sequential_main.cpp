@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     (void)argv;
 
     // Select demo instance size (controls number of activities, groups, etc.).
-    DemoSize size = DemoSize::M;
+    DemoSize size = DemoSize::XXL;
 
     // Create a synthetic problem instance for testing/benchmarking.
     ProblemInstance inst = makeDemoInstance(size);

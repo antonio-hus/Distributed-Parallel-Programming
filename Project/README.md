@@ -3,43 +3,34 @@
 ## Problem Statement
 
 ### Common Requirements
-Each student or team of 2 students will take one project. It is ok to take a theme that is not listed below (but check with the lab advisor before starting).
 
+Each student or team of 2 students will take one project. It is ok to take a theme that is not listed below (but check with the lab advisor before starting).
 Each project will have 2 implementations: one with "regular" threads or tasks/futures, and one distributed (possibly, but not required, using MPI). A third implementation, using OpenCL or CUDA, can be made for a bonus.
 
 The documentation will describe:
-- The algorithms,
-- The synchronization used in the parallelized variants,
-- The performance measurements
+- the algorithms,
+- the synchronization used in the parallelized variants,
+- the performance measurements
 
-### Theme
-Generate a school timetable through exhaustive search.
+### Theme: School Timetabling by Exhaustive Search
 
-## Project Overview
+Theme: **Generate a school timetable through exhaustive search**.
+
+The project generates a weekly school/university timetable by exhaustive search over all valid assignments of teaching activities to time slots and rooms. The search enforces a rich set of hard constraints (no overlaps, qualification, travel time, workload) and optimizes a soft-constraint score (late slots, gaps, building locality).
+
+***
+
+## Problem Model
+
 Construct a weekly timetable for a small university-like setting, given:
 
 - A fixed weekly time grid (Monday–Friday, 08:00–20:00, 2-hour slots).
-- A set of **buildings** with rooms and travel times between buildings.
-- A set of **subjects**, each requiring a number of course/seminar/lab slots.
-- A set of **professors**, each qualified to teach specific subjects and activity types.
-- A set of **student groups**, with the list of subjects they attend.
+- A set of buildings with rooms and travel times between buildings.
+- A set of subjects, each requiring course/seminar/lab slots per week.
+- A set of professors, each qualified to teach specific subjects and activity types.
+- A set of student groups, with the subjects they attend.
 
-Each project must provide:
-
-1. A **sequential implementation** using exhaustive search / backtracking.
-2. A **shared-memory parallel implementation** (threads/tasks/futures).
-3. A **distributed implementation** (e.g., MPI), partitioning the search space across processes.
-4. An implementation using **OpenCL**.
-
-The documentation describes:
-- The algorithms used (state representation, backtracking, pruning).
-- The synchronization mechanisms in the parallel and distributed variants.
-- Performance measurements and scalability.
-- For OpenCL: the formulation of the problem as data-parallel kernels.
-
----
-
-## Problem Model
+The core data model:
 
 ### Time Model
 
@@ -51,46 +42,47 @@ The documentation describes:
     - Slot 3: 14:00–16:00
     - Slot 4: 16:00–18:00
     - Slot 5: 18:00–20:00
-- **Time slot:** represented as `(day, slot)`, where `day ∈ {0..4}`, `slot ∈ {0..5}`.
+- **Time slot:** `(day, slot)`, where `day ∈ {0..4}`, `slot ∈ {0..5}`.
 
 ### Buildings and Rooms
 
 - **Building**
     - `id`
-    - List of **rooms** contained in this building.
-    - Symmetric `travelTime[buildingA][buildingB]` in minutes.
+    - `name`
+    - Appears in the `travelTime[buildingA][buildingB]` matrix (minutes between buildings).
 
 - **Room**
     - `id`
     - `buildingId`
-    - `capacity` (optional, can be used for extra constraints).
-    - `type ∈ {COURSE, SEMINAR, LAB}` (room suitability).
+    - `name` (e.g. `"C301"`)
+    - `capacity` (optional for extra constraints)
+    - `type ∈ {COURSE, SEMINAR, LAB}` (suitability for activity types)
 
 ### Subjects and Activities
 
 - **Subject**
     - `id`
     - `name`
-    - Weekly requirements (in number of 2-hour slots):
+    - Weekly requirements in 2-hour slots:
         - `courseSlots`
         - `seminarSlots`
         - `labSlots`
 
-From subjects + groups + prof qualifications, the project generates **activities**:
+From subjects, groups, and professor qualifications, the project generates **activities**:
 
 - **Activity**
     - `id`
     - `subjectId`
     - `type ∈ {COURSE, SEMINAR, LAB}`
-    - `groupId` (the student group attending)
-    - `profId` (the professor teaching it)
-    - `durationSlots = 1` (2 hours per activity)
+    - `profId` (professor teaching)
+    - `groupIds` (list of student groups attending)
+    - `durationSlots = 1` (each activity = one 2-hour slot)
 
-**Course activities are special:**
+**Course activities:**
 
-- For each subject with `courseSlots > 0`, the course activities are shared by **all groups that take that subject**.
-- At a course time, all those groups must be free and must attend the course.
-- Nothing can overlap with a course for those groups—courses act as global sessions for the subject’s groups.
+- For each subject with `courseSlots > 0`, each course activity is shared by **all groups** that take that subject.
+- At a course time, all those groups must attend and must be free (no overlap with other activities).
+- Courses are global joint sessions for that subject’s groups.
 
 ### Professors
 
@@ -101,7 +93,7 @@ From subjects + groups + prof qualifications, the project generates **activities
     - `canTeachSeminar: set<subjectId>`
     - `canTeachLab: set<subjectId>`
 
-Only valid `(subject,type,prof)` combinations are turned into `Activity` instances.
+Only valid `(subject, type, prof)` combinations are turned into `Activity` instances.
 
 ### Student Groups
 
@@ -110,360 +102,539 @@ Only valid `(subject,type,prof)` combinations are turned into `Activity` instanc
     - `name`
     - `subjects: set<subjectId>` they attend.
 
-For each `(group,subject)` and each required slot type, activities are generated:
+For each `(group, subject)` and each required slot type:
 
-- `courseSlots`: one course activity per slot, attended jointly by all groups of that subject.
+- `courseSlots`: one course activity per slot, attended by all groups of that subject.
 - `seminarSlots` and `labSlots`: group-specific activities.
 
----
+***
 
 ## Timetable Representation
 
 A **timetable** is a complete mapping of every `Activity` to:
 
 - A time slot `(day, slot)`
-- A `roomId`
+- A `roomId` (or `roomIndex` into the rooms array)
 
 Formally:
 
-```
+```text
 ActivityId -> (day, slot, roomId)
 ```
 
-The search algorithm manipulates **partial timetables**, gradually assigning activities while ensuring constraints are respected.
+The search algorithm manipulates **partial timetables**, represented as:
 
----
+```cpp
+struct Placement {
+    int activityId;  // -1 if unused
+    int day;
+    int slot;
+    int roomIndex;
+};
+```
+
+A `std::vector<Placement>` is indexed by `activityId`. During search, some entries are still unused (`activityId == -1`).
+
+A `TimetableState` object maintains incremental schedules for rooms, groups, and professors, plus professor workloads.
+
+***
 
 ## Hard Constraints
 
-A timetable is **valid** if all the following constraints are satisfied:
+A timetable is **valid** if all these constraints are satisfied:
 
 1. **Time Window Constraint**
-    - All activities must be assigned to slots 0–5 (08:00–20:00).
-    - Enforced structurally by using only these slots.
+    - All activities must be assigned to days `0..4` and slots `0..5` (08:00–20:00).
+    - Enforced structurally by iterating only valid `(day, slot)` pairs.
 
 2. **Room Occupancy Constraint**
-    - At most one activity per `(day, slot, roomId)`.
-    - Implementation: `roomSchedule[room][day][slot]` must be empty before placing an activity.
+    - At most one activity per `(day, slot, room)`.
+    - Implementation:
+        - `roomSchedule[room][day][slot]` is either `kNone` (empty) or an `activityId`.
+        - `place` rejects placements where the room is already occupied.
 
 3. **Group No-Overlap Constraint**
     - A group cannot attend two activities at the same time.
-    - For each `group`, `(day,slot)` can be assigned to at most one activity.
-    - Implementation: `groupSchedule[group][day][slot]` check.
+    - Implementation:
+        - `groupSchedule[group][day][slot]` must be `kNone` for all groups of the activity; otherwise `place` fails.
 
 4. **Professor No-Overlap Constraint**
     - A professor cannot teach two activities at the same time.
-    - For each `prof`, `(day,slot)` can be assigned to at most one activity.
-    - Implementation: `profSchedule[prof][day][slot]` check.
+    - Implementation:
+        - `profSchedule[prof][day][slot]` must be `kNone`; otherwise `place` fails.
 
 5. **Course = All-Groups Constraint**
-    - Every course activity for a subject is scheduled at `(day,slot)` where:
-        - All groups taking that subject are free.
-        - None of those groups has any other activity at that time.
+    - For a course activity:
+        - All groups taking the subject must be free at `(day, slot)`.
+        - No other activity overlaps for those groups at that time.
     - Implementation:
-        - When assigning a course `(subjectId, COURSE)`, iterate all its groups and ensure their `(day,slot)` is free.
-        - Mark `(day,slot)` occupied by this course for all those groups.
+        - When placing a course `(subjectId, COURSE)`:
+            - Iterate all groups in `activity.groupIds`.
+            - Check their `groupSchedule[group][day][slot]` entries.
+            - On success, mark the course in all those group schedules.
 
 6. **Professor Qualification Constraint**
-    - Only professors allowed to teach `(subject,type)` may be assigned to that activity.
-    - Enforced at generation time (activity list generation) or checked when assigning.
+    - Only professors allowed to teach `(subject, type)` may be assigned.
+    - Implementation:
+        - Enforced at activity generation; solvers only see valid `Activity` instances.
 
 7. **Room Type Constraint**
-    - Activity type must be compatible with room type:
-        - `COURSE` → course/lecture rooms.
+    - Activity type must match room type:
+        - `COURSE` → course rooms.
+        - `SEMINAR` → seminar rooms.
         - `LAB` → lab rooms.
-        - `SEMINAR` → seminar or general-purpose rooms.
-    - Implementation: check `room.type` against `activity.type`.
+    - Implementation:
+        - Before calling `place`, the solver checks `room.type` vs `activity.type`.
 
 8. **Travel Time Constraint (Groups and Professors)**
     - No impossible back-to-back jumps between buildings:
-        - If a group or professor has activities scheduled consecutively at `(day,slot)` in building `A` and `(day,slot+1)` in building `B`, then the travel time `travelTime[A][B]` must be ≤ allowed break (e.g., 10 minutes).
+        - If a group or professor has activities in consecutive slots in a day, the travel time between the two buildings must fit into a fixed break (e.g. 10 minutes).
     - Implementation:
-        - When placing an activity in `roomBuilding` at `(day,slot)`:
-            - Check `slot-1` and `slot+1` for the same group/prof (if already scheduled).
-            - If adjacent exists, enforce the travel-time bound.
+        - When placing an activity in `roomBuilding` at `(day, slot)`:
+            - Check `slot-1` and `slot+1` in `groupSchedule` and `profSchedule`.
+            - If an adjacent activity exists, compare building indices via `travelTime`.
+            - Reject placements where `travelTime[A][B]` exceeds allowed break.
 
 9. **Professor Weekly Workload Constraints**
-    - Lower bound: Each professor must have **at least 20 hours** of teaching per week.
-        - With 2-hour slots, this means at least 10 activities.
-    - Upper bound (optional but enforced in this project): Each professor must have **at most 40 hours** per week.
-        - With 2-hour slots, at most 20 activities.
+    - Lower bound: at least **20 hours** (10 activities) per week.
+    - Upper bound: at most **40 hours** (20 activities) per week.
     - Implementation:
-        - After a full timetable is built, for each professor:
-            - Let `count` be the number of assigned activities.
-            - Check `count * 2 ≥ 20` and `count * 2 ≤ 40`.
+        - `profHours[prof]` stores current hours (each activity adds 2 hours).
+        - Incremental upper bound:
+            - During `place`, reject assignments that would exceed 40 hours.
+        - Final global bound:
+            - After a full timetable is built, `checkFinalWorkloadBounds()` verifies `20 ≤ totalHours ≤ 40` for all professors.
 
-These workload bounds can also be used for pruning: if in a partial schedule a professor already exceeds 40 hours or cannot possibly reach 20 hours even if all remaining eligible activities are assigned, the branch can be pruned early.
+These bounds can be used for additional pruning (see below).
 
----
+***
 
-## Soft Constraints (Optional)
+## Soft Constraints and Scoring
 
-These define a **score** for timetables; lower score is better:
+Soft constraints define a **score**; lower score is better. A timetable’s score is a non-negative integer built from:
 
 1. **Avoid Late Slots**
-    - Penalize activities scheduled in slots 4 and 5 (16:00–20:00).
+    - Activities in slots 4 and 5 (16:00–20:00) are penalized (e.g. +1 per activity).
 
 2. **Compact Days for Groups**
-    - Penalize large gaps within a group’s day (long idle periods between first and last activity).
+    - For each group and day:
+        - Let `first` = first occupied slot, `last` = last occupied slot.
+        - Count idle slots between `first` and `last`.
+        - Each gap slot adds 1 penalty.
 
 3. **Compact Days for Professors**
-    - Similar penalization for professors’ schedules.
+    - Same as above, but for each professor and day.
 
 4. **Building Locality**
-    - Penalize days where a group/prof uses more than a certain number of different buildings.
+    - For each group and professor:
+        - For each day, compute the set of buildings used.
+        - Using more than 2 distinct buildings that day incurs a penalty for each extra building.
 
-The sequential exhaustive search can keep the **best** valid timetable according to this score; parallel and distributed variants do the same while exploring multiple branches concurrently.
+All CPU solvers share the same scoring function. The OpenCL implementation implements the equivalent logic inside kernels.
 
----
+***
 
-## Algorithms Overview
+## Algorithms
 
 ### Sequential Backtracking Algorithm
 
 #### Theory
-- The full search space is huge, but constraints allow aggressive pruning.
-- Depth-first search:
-    - Activities are sorted in a heuristic order.
-    - At depth `k`, the algorithm assigns `activities[k]` to each allowed `(day,slot,room)` position that satisfies local constraints.
-    - If all activities are assigned:
-        - Check global constraints (workload bounds).
-        - Compute timetable score and update best solution if needed.
 
-#### Implementation Strategy
+The search space (all mappings of activities to `(day, slot, room)`) is enormous, but practical instances can be solved by:
 
-**State Representation:**
+- Enforcing all hard constraints incrementally.
+- Ordering activities to expose conflicts early.
+- Optionally using workload bounds for pruning.
+- Exploring with depth-first search (DFS).
 
-- Arrays/maps:
-    - `roomSchedule[room][day][slot]`
-    - `groupSchedule[group][day][slot]`
-    - `profSchedule[prof][day][slot]`
-- Additional counters:
+#### State Representation
+
+- `TimetableState` holds:
+    - `roomSchedule[room][day][slot]`.
+    - `groupSchedule[group][day][slot]`.
+    - `profSchedule[prof][day][slot]`.
     - `profHours[prof]` (current workload in hours).
 
-**Activity Ordering:**
+- `std::vector<Placement> placements` indexed by `activityId`.
 
-- Courses first (higher fan-out due to all-group constraint).
-- Then activities involving scarce resources (rooms/profs).
-- This improves pruning effectiveness.
+- `orderedActivities`:
+    - A copy of all activities sorted by a heuristic:
+        - Courses first.
+        - For equal type, higher `groupIds.size()` first.
 
-**Pruning:**
+#### Depth-First Search
 
-- On each assignment:
-    - Check local constraints (room, group, prof collisions, travel time, room type).
-- During recursion:
-    - For each professor:
-        - If `profHours[prof] > 40`, prune immediately.
-        - If `profHours[prof] + remainingAssignableHours < 20`, prune (cannot reach minimum).
-    - For each group:
-        - If free slots remaining are insufficient to place its remaining activities, prune.
+Pseudo-structure:
 
----
+```cpp
+void backtrack(int depth) {
+    if (solutionsFound >= maxSolutions) return;
 
-### Shared-Memory Parallel Implementation
+    if (depth == orderedActivities.size()) {
+        if (!state.checkFinalWorkloadBounds()) return;
 
-#### Parallel Backtracking with Tasks
+        int score = computeScore(placements);
+        if (score < bestScore) {
+            bestScore = score;
+            best = { placements, score };
+        }
+        ++solutionsFound;
+        return;
+    }
 
-**Decomposition:**
+    const Activity& act = orderedActivities[depth];
 
-- Choose a depth `D` as a frontier.
-- Sequentially explore all assignments to the first `D` activities, generating a set of partial states.
-- For each partial state, submit a **task** to a thread pool or use futures.
+    for (int day = 0; day < DAYS; ++day)
+        for (int slot = 0; slot < SLOTS_PER_DAY; ++slot)
+            for (int roomIdx = 0; roomIdx < numRooms; ++roomIdx) {
 
-**Execution:**
+                if (!roomTypeCompatible(act, roomIdx)) continue;
 
-- Each worker thread:
-    - Takes one partial timetable.
-    - Runs the same backtracking algorithm from depth `D` onward.
-    - Reports:
-        - Number of valid full timetables found (optional) and/or
-        - Best timetable and its score.
+                if (state.place(act, day, slot, roomIdx)) {
+                    placements[act.id] = { act.id, day, slot, roomIdx };
+                    backtrack(depth + 1);
+                    state.undo(act, day, slot, roomIdx);
+                }
+            }
+}
+```
 
-**Synchronization:**
+#### Pruning
 
-- Shared best solution:
-    - Protected by a `std::mutex` or a lock-free compare-and-swap on score + index.
-- Task distribution:
-    - Shared queue protected by mutex/condition variable, or use a work-stealing scheduler.
-- No sharing of partial timetables except as immutable snapshots.
+- Local checks in `place` reject:
+    - Room, group, prof overlaps.
+    - Course all-groups constraints.
+    - Travel-time violations.
+    - Professor workload upper bound.
 
----
+- Global check:
+    - After all activities are placed, `checkFinalWorkloadBounds()` enforces the minimum workload.
+
+- Potential extra pruning:
+    - For each professor, if `profHours[prof] > 40`, prune immediately.
+    - If `profHours[prof] + remainingAssignableHours < 20`, prune.
+    - Similarly, for groups, if remaining free slots are insufficient to place remaining activities, prune.
+
+The sequential solver acts as the baseline for all performance comparisons.
+
+***
+
+### Shared-Memory Parallel Implementation (Threads)
+
+The threaded solver parallelizes backtracking by splitting the search tree at a **frontier depth** `D`.
+
+#### Decomposition
+
+1. **Frontier generation (sequential):**
+    - Starting from an empty `TimetableState`, run DFS down to depth `D`.
+    - For each leaf at depth `D` (or when all activities are placed earlier), store a `PartialState`:
+        - `TimetableState state` (snapshot).
+        - `std::vector<Placement> placements`.
+        - `int depth` (next activity index).
+
+2. **Parallel exploration:**
+    - Create `numThreads` worker threads.
+    - Store all `PartialState` objects in a shared vector `frontier`.
+    - Use a shared index `frontierIndex` to distribute work:
+        - Each thread:
+            - Atomically claims `frontier[frontierIndex++]`.
+            - Copies its `state` and `placements`.
+            - Runs DFS from `depth` until the subtree is fully explored or `maxSolutions` is reached.
+
+This yields coarse-grained tasks: each task corresponds to exploring the subtree under one partial timetable.
+
+#### Execution
+
+Each worker executes:
+
+```cpp
+void workerLoop() {
+    while (true) {
+        PartialState* ps = claimNextPartialState();
+        if (!ps) break;
+        backtrackFromPartial(*ps);
+    }
+}
+```
+
+`backtrackFromPartial` is structurally identical to the sequential DFS, starting from the recorded `depth` and using the copied `TimetableState` and placements.
+
+#### Synchronization
+
+- **Frontier distribution:**
+    - `frontierIndex` is protected by a mutex (`queueMutex`).
+    - Ensures each `PartialState` is processed exactly once.
+
+- **Shared best solution:**
+    - Shared global variables:
+        - `TimetableSolution best`.
+        - `int bestScore`.
+        - `int solutionsFound`.
+    - Updates protected by `bestMutex`:
+        - After a full timetable is found and passes `checkFinalWorkloadBounds()`, the worker computes the score and under the lock:
+            - If `score < bestScore`, update `best` and `bestScore`.
+            - Increment `solutionsFound`.
+
+- **State isolation:**
+    - Each worker has its own local copy of `TimetableState` and placement vector; there is no shared mutable search state.
+    - Only task distribution and best-solution variables are shared.
+
+***
 
 ### Distributed Implementation (MPI)
 
-#### Master–Worker Backtracking
+The MPI-based solver extends parallelism across processes using a **hybrid** approach: MPI ranks + internal threads.
 
-**Data Setup:**
+There are two conceptual designs; this project uses the **multi-start** design.
 
-- Rank 0 (master) reads instance data and broadcasts:
-    - Buildings, rooms, travel times.
-    - Subjects, groups, professors, and generated activities.
-- All ranks hold identical copies of immutable data.
+#### Hybrid Multi-Start Design
 
-**Work Partitioning:**
+- Each MPI rank:
+    - Holds the same `ProblemInstance` in memory.
+    - Creates a local copy and **randomly shuffles** the activity order with a rank-dependent RNG seed.
+    - Runs the threaded solver:
+        - With its own `maxSolutions`.
+        - With `numThreads` threads.
+        - With a chosen `frontierDepth`.
 
-- Master runs sequential backtracking down to depth `D`, producing many partial timetables (frontier nodes).
-- Each partial timetable is serialized and sent to a worker process.
+- Because the activity order and thus the search order differ per rank, the ranks explore different parts of the search space and are likely to find good solutions at different times.
 
-**Worker Process:**
+#### Global Reduction of Best Score
 
-- Receives a partial timetable and starting depth.
-- Performs backtracking locally until all activities are assigned or pruned.
-- Sends back:
-    - Number of valid timetables.
-    - Best timetable (lowest score) in its subtree, if any.
+- After local search, each rank has:
+    - Either a local best solution with score `localScore`.
+    - Or no solution, represented by `localScore = +∞`.
 
-**Result Aggregation:**
+- Using MPI:
+    - A global `MPI_Allreduce` with `MPI_MIN` finds `globalBestScore`.
+    - A second reduction identifies the **winning rank** (the rank that achieved `globalBestScore`).
 
-- Master gathers results from all workers.
-- Chooses the globally best timetable and computes summary statistics.
+#### Solution Transfer
 
-**Synchronization:**
+- If rank 0 is the winner:
+    - It already has the best timetable and simply prints or returns it.
 
-- Master tracks outstanding tasks and workers.
-- Workers terminate when they receive a “no more work” message.
-- No shared memory between processes; all coordination is via MPI messages.
+- If a non-zero rank is the winner:
+    - The winner serializes its placements into a flat integer buffer:
+        - For each `Placement`, send `(activityId, day, slot, roomIndex)`.
+    - It sends the buffer length and data to rank 0.
+    - Rank 0 receives the data, reconstructs the timetable, and presents it as the global best.
 
----
+#### Synchronization
+
+- Between ranks:
+    - Only MPI collectives (`MPI_Allreduce`) and point-to-point (`MPI_Send`/`MPI_Recv`) are used.
+    - No shared memory or locks, processes are independent.
+
+- Within each rank:
+    - The same thread-level synchronization as in the threaded solver (mutex-protected best solution, frontier index).
+
+The result is a **hybrid MPI + threads** solver that scales across cores (threads) and nodes/processes (MPI).
+
+***
 
 ## OpenCL Implementation (Bonus)
 
 ### Motivation
 
-While exhaustive backtracking is inherently irregular and branchy (not ideal for GPUs), OpenCL can still be used to accelerate **hot inner loops** and **constraint evaluation** when exploring multiple candidate assignments in parallel.
+Exhaustive backtracking is highly irregular, making it a poor fit for GPUs as a whole-program algorithm. However, the **scoring of many complete timetables** is data-parallel:
 
-### OpenCL Formulation
+- Each candidate timetable is independent.
+- The score function is identical and does not branch heavily on a per-candidate basis.
 
-#### Data Layout
+Therefore, the project uses OpenCL to accelerate **batched scoring** of complete timetables, while keeping backtracking and hard constraints on the CPU.
 
-Immutable data copied once to GPU buffers:
+### CPU–GPU Work Split
 
-- `buildings` and `travelTime` matrix.
-- `rooms` (type, building).
-- `subjects`, `groups`, `professors`.
-- Precomputed activity metadata (`subjectId`, `type`, `groupId`, `profId`).
+- **CPU:**
+    - Runs DFS with full `TimetableState` enforcement of hard constraints.
+    - Every time a complete timetable is produced, append its placements to a batch.
+    - When the batch reaches `batchSize`, offload it to the GPU.
 
-Dynamic data:
+- **GPU (OpenCL):**
+    - Receives batches of candidates.
+    - For each candidate, reconstructs schedules and computes:
+        - Late slot penalties.
+        - Group day gaps.
+        - Professor day gaps.
+        - Building-locality penalties.
+    - Returns:
+        - `validFlags[i]` for structural checks.
+        - `scores[i]` for soft constraints.
 
-- Arrays encoding candidate schedules or partial states to be scored.
+The host scans the results and updates the global best based on scores.
 
-#### Kernel Types
+### Data Layout
 
-1. **Constraint Evaluation Kernel**
-    - Input: flat encodings of multiple candidate timetables or partial timetables.
-    - Each **work-item** validates one candidate:
-        - Checks hard constraints:
-            - Room occupancy.
-            - Group/prof overlaps.
-            - Course all-groups constraint.
-            - Travel time constraints.
-            - Professor workloads (20–40h).
-        - Computes a boolean validity flag.
-    - Each **work-item** also computes the soft-constraint score.
+Immutable data copied once to device:
 
-2. **Score Computation / Reduction Kernel**
-    - Input: scores for valid candidates.
-    - Goal: find minimum score and index of best candidate.
-    - Classic parallel reduction pattern.
+- Buildings and `travelTime`.
+- Rooms (building, type).
+- Subjects, groups, professors.
+- Activity metadata (subjectId, type, profId, groupIds).
 
-#### Usage in the Algorithm
+Per-batch dynamic data:
 
-- CPU side (host):
-    - Generates batches of candidate assignments (partial or full timetables).
-    - Offloads constraint checking and scoring to the GPU:
-        - Sends the batch to the OpenCL kernel.
-        - Reads back validity flags and scores.
-    - Uses results to:
-        - Filter out invalid candidates quickly.
-        - Select promising candidates for deeper CPU backtracking.
-- Possible strategy:
-    - At some shallow depth, enumerate many partial assignments on CPU.
-    - Pack them into a batch and send them to GPU for fast constraint pruning.
-    - Only keep partial states that pass GPU checks and show good scores.
+- Flat encodings of candidate `Placement` lists, one per timetable.
+- Output validity and score arrays.
+
+### Kernel Types
+
+1. **Evaluation Kernel**
+    - One work-item per timetable.
+    - Builds occupancy maps for groups/profs/rooms as needed.
+    - Checks any remaining structural constraints (e.g., bounds).
+    - Computes the score from soft constraints.
+
+2. **Optional Reduction Kernel**
+    - Finds the minimum score and its index in parallel.
+    - In practice, this project does reduction on host for simplicity.
 
 ### Synchronization and Data Movement
 
-- Host–device synchronization:
-    - Blocking `clEnqueueReadBuffer` after kernel execution, or events for async.
-- No device-side locks:
-    - Each work-item operates independently on its own candidate.
-- Performance trade-offs:
-    - Amortize PCIe transfer costs by evaluating large batches at once.
-    - Use struct-of-arrays (SoA) layout for coalesced memory access.
+- On device:
+    - No locks; each work-item touches its own candidate data and output.
 
----
+- Host–device:
+    - Kernel launches are followed by blocking reads of `validFlags` and `scores` or by using events (future extension).
+    - Batches are sized to amortize PCIe transfer cost.
+
+This design demonstrates how to use OpenCL to accelerate a CPU-centric exhaustive search.
+
+***
+
+## Demo Instances and Scaling
+
+The project defines several demo sizes:
+
+```cpp
+enum class DemoSize { XS, S, M, L, XL, XXL, XXXL };
+ProblemInstance makeDemoInstance(DemoSize size);
+```
+
+Each size corresponds to a synthetic instance with different numbers of:
+
+- Buildings and rooms.
+- Professors and groups.
+- Subjects and resulting activities.
+
+Typical usage:
+
+- `XS`, `S`: small instances for correctness testing and debugging.
+- `M`: medium instance used for most demonstrations and comparisons.
+- `L`, `XL`, `XXL`, `XXXL`: larger instances to stress-test the algorithms and highlight scalability of threads/MPI/OpenCL.
+
+***
 
 ## Performance Measurements
 
-### Test Configuration (Example)
+### Example Test Configuration
 
-- **Time grid:** 5 × 6 slots.
-- **Scale:**
-    - Buildings: 2.
+For actual measurements, the following parameters are used (example):
+
+- Time grid: 5 days × 6 slots.
+- Scale (for medium size):
+    - Buildings: ~2.
     - Rooms: ~6.
-    - Groups: 3 or 4.
+    - Groups: 3–4.
     - Subjects: 5–8.
-    - Activities: ~20–40 (courses + seminars + labs).
-- **Implementations:**
-    - Sequential backtracking (baseline).
-    - Shared-memory threaded version (2, 4, 8 threads).
-    - MPI version (2, 4, 8 processes).
-    - Optional: OpenCL-accelerated constraint evaluation for batches.
+    - Activities: 20–40.
+
+Implementations tested:
+
+- Sequential backtracking baseline.
+- Threaded solver with 2, 4, 8, 16 threads.
+- MPI+threads solver with 2, 4, 8 processes (each with a fixed number of threads).
+- OpenCL solver with batch sizes such as 128, 512, 2048.
 
 ### Metrics
 
-- Runtime for each implementation and configuration.
-- Speedup relative to sequential baseline.
-- Number of explored states (nodes) in the search tree:
-    - Helps explain why some variants scale better.
-- For OpenCL:
-    - Batch size vs kernel time.
-    - Benefit from offloading constraint checking.
+For each implementation and configuration:
 
----
+- **Runtime**:
+    - Wall-clock time to find the best timetable (or to explore a fixed number of solutions).
+
+- **Speedup**
+- **Scalability**:
+    - How speedup evolves with:
+        - Number of threads.
+        - Number of MPI processes.
+        - OpenCL batch size.
+
+- **Search statistics** (if counters are enabled):
+    - Number of complete timetables generated.
+    - Total number of backtracking nodes visited.
+
+- **OpenCL-specific metrics**:
+    - Kernel execution time vs. data transfer time.
+    - Impact of batch size on GPU utilization.
+
+These measurements can be summarized in tables and plots. The discussion should explain:
+
+- Why speedup deviates from linear (overhead, imbalance, contention).
+- When MPI+threads is beneficial compared to threads only.
+- When OpenCL scoring dominates, and how batch size affects performance.
+
+| Demo size | Activities | Seq time [ms] | Threads time [ms] | MPI+Threads time [ms] | OpenCL time [ms] | Seq config (maxSolutions) | Threads config (threads, frontierDepth, maxSolutions) | MPI config (ranks, threads, maxSolutions) | OpenCL config (batchSize, maxSolutions) |
+|-----------|------------|---------------|-------------------|-----------------------|------------------|---------------------------|-------------------------------------------------------|-------------------------------------------|---------------------------------------|
+| XS        | 6          | 0.1423 ms     | 13.6796 ms        | 14.1764 ms            | 31.3419 ms       | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+| S         | 6          | 0.2167 ms     | 16.3747 ms        | 14.5163 ms            | 34.4062 ms       | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+| M         | 13         | 0.3576 ms     | 16.0067 ms        | 15.1763 ms            | 33.6328 ms       | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+| L         | 30         | 0.5335 ms     | 65.4665 ms        | 18.3478 ms            | 34.5398 ms       | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+| XL        | 45         | -             | 72.0952 ms        | 107.302 ms            | 33.0638 ms       | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+| XXL       | 60         | -             | -                 | -                     | -                | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+| XXXL      | 90          | -             | -                 | -                     | -                | 1                         | 16, 2, 1                                              | size=4, 16, 1                             | 512, 1                                |
+
+***
 
 ## Invariants and Correctness
 
 ### Structural Invariants
 
 - For each `(day, slot, room)`:
-    - At most one activity.
+    - At most one activity is scheduled.
 - For each `(group, day, slot)`:
-    - At most one activity.
-- For each `(prof, day, slot)`:
-    - At most one activity.
+    - At most one activity is scheduled.
+- For each `(professor, day, slot)`:
+    - At most one activity is scheduled.
 
 ### Course Invariants
 
-- Every course activity for `(subjectId)` is scheduled at times where:
-    - All groups attending that subject are free and assigned to that course.
-- No group activity overlaps with its subject’s course times.
+- Every course activity for a subject is scheduled at times where:
+    - All groups attending that subject are free.
+    - Those groups are all assigned to that course activity at that time.
+- No other group activities overlap with their subject’s course times.
 
 ### Travel Invariants
 
 - For each group and professor:
-    - For any pair of consecutive slots in the same day, either:
-        - Activities are in the same building, or
-        - The travel time between buildings fits in the slot break.
+    - Any pair of consecutive activities in the same day is either:
+        - In the same building, or
+        - In buildings whose travel time fits into the break between slots.
 
 ### Workload Invariants
 
 - For each professor:
-    - `20 ≤ totalHours ≤ 40`.
+    - Total teaching hours satisfy `4 ≤ totalHours ≤ 40`.
 
 ### Parallel/Distributed Invariants
 
-- Shared-memory:
-    - No concurrent modification of the same partial timetable by multiple threads.
-    - Global best timetable updates are atomic/mutex-protected.
-- MPI:
-    - Each partial state is processed by exactly one worker.
-    - Master correctly aggregates counts and best scores.
-- OpenCL:
-    - Kernels are pure functions on input data; no side effects besides writing to output buffers.
-    - Host code checks all kernel outputs before accepting a candidate as valid.
+- **Shared-memory:**
+    - No two threads modify the same `TimetableState` instance concurrently.
+    - Global best solution and counters are updated under mutex protection.
 
----
+- **MPI:**
+    - Each rank handles its own search space (multi-start) and never shares mutable state with others.
+    - Global reductions correctly identify the best score and corresponding rank.
+    - When using a master–worker pattern (alternative design), each partial state is processed by exactly one worker.
+
+- **OpenCL:**
+    - Kernels are pure functions over input data, writing only to their designated output positions.
+    - Host code validates flags and scores before accepting a candidate timetable.
+
+Together, these invariants ensure that all implementations produce valid timetables, agree on constraint semantics, and differ only in how they explore the search space and how fast they reach good solutions.
+
+***
 
 **Author:** Antonio Hus  
 **Date:** 17.11.2025  

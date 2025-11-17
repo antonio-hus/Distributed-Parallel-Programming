@@ -25,17 +25,17 @@ int main(int argc, char** argv) {
     (void)argv;
 
     // Choose which demo problem size to run (number of activities, etc.).
-    DemoSize size = DemoSize::M;
+    DemoSize size = DemoSize::XXL;
 
     // Construct a synthetic problem instance with activities, rooms, groups, etc.
     ProblemInstance inst = makeDemoInstance(size);
 
     // Configure the threaded solver:
     //  - maxSolutions = 1  -> stop after first (best-so-far) complete solution,
-    //  - numThreads   = 4  -> use four worker threads,
+    //  - numThreads   = 16  -> use four worker threads,
     //  - frontierDepth = 2 -> split search tree after assigning first 2 activities.
     int maxSolutions = 1;
-    int numThreads = 4;
+    int numThreads = 16;
     int frontierDepth = 2;
     ThreadedBacktrackingSolver thrSolver(/*maxSolutions=*/maxSolutions, /*numThreads=*/numThreads, /*frontierDepth=*/frontierDepth);
 

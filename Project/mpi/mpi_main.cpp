@@ -33,19 +33,32 @@ int main(int argc, char** argv) {
         std::cout << "========================================\n";
     }
 
-    // Use a medium-size synthetic problem instance for distributed tests.
-    DemoSize demoSize = DemoSize::M;
+    // Use a small synthetic problem instance for distributed tests.
+    DemoSize demoSize = DemoSize::XXL;
     ProblemInstance inst = makeDemoInstance(demoSize);
 
     // Hybrid solver:
     //  - maxSolutions: per-rank limit of solutions explored,
     //  - numThreads:   threads used inside each MPI process.
-    int maxSolutions = 1000000;
+    int maxSolutions = 1;
     int numThreads = 16;
-    MPIHybridMultiStartSolver solver(/*maxSolutions=*/maxSolutions, /*numThreads=*/numThreads);
+    MPIHybridMultiStartSolver solver(/*maxSolutions=*/maxSolutions,
+            /*numThreads=*/numThreads);
+
+    // Barrier to make sure all ranks start timing at the same moment.
+    MPI_Barrier(MPI_COMM_WORLD);
+    double tStart = MPI_Wtime();
 
     // All ranks participate; rank 0 will print the best result.
     solver.solve(inst);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double tEnd = MPI_Wtime();
+    double elapsedMs = (tEnd - tStart) * 1000.0;
+
+    if (rank == 0) {
+        std::cout << "Total MPI+threads time: " << elapsedMs << " ms\n";
+    }
 
     MPI_Finalize();
     return 0;

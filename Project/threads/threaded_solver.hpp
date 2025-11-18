@@ -8,9 +8,8 @@
 #include "solver_base.hpp"
 #include <optional>
 #include <vector>
-#include <thread>
 #include <mutex>
-#include <memory>
+#include <atomic>
 
 
 ///////////////////////////
@@ -19,18 +18,18 @@
 /**
  * @brief Multithreaded backtracking solver for timetable generation.
  *
- * Builds a frontier of partial states up to a given depth, then explores the
- * remaining search space in parallel using multiple worker threads.
+ * Uses dynamic thread-splitting at each branch in the search tree, where all feasible choices
+ * for the current activity are divided among the available worker threads. Each thread explores
+ * its assigned subtree in parallel, with early termination and thread-safe best solution selection.
  */
 class ThreadedBacktrackingSolver {
 public:
     /**
      * @brief Create a threaded backtracking solver.
      *
-     * @param maxSolutions Maximum number of complete solutions to process before stopping.
-     * @param numThreads   Number of worker threads used in the parallel phase.
-     * @param frontierDepth Depth at which the initial sequential search stops
-     *                      and frontier states are generated.
+     * @param maxSolutions   Maximum number of complete solutions to process before stopping.
+     * @param numThreads     Number of worker threads for parallel exploration.
+     * @param frontierDepth  (Unused in dynamic mode, kept for API compatibility)
      */
     ThreadedBacktrackingSolver(int maxSolutions, int numThreads, int frontierDepth);
 
@@ -43,72 +42,35 @@ public:
     std::optional<TimetableSolution> solve(const ProblemInstance& inst);
 
 private:
-    /**
-     * @brief Partially constructed timetable at a given search depth.
-     *
-     * Used as a frontier node from which worker threads continue backtracking.
-     */
-    struct PartialState {
-        TimetableState state; ///< Incremental timetable state.
-        std::vector<Placement> placements; ///< Placements chosen so far.
-        int depth; ///< Index in the ordered activity list.
-    };
-
     /// Pointer to the problem instance being solved (valid only during solve()).
     const ProblemInstance* inst_ = nullptr;
 
-    int maxSolutions_; ///< Max number of solutions to process before termination.
-    int numThreads_; ///< Number of worker threads.
-    int frontierDepth_; ///< Depth where sequential search hands off to threads.
+    int maxSolutions_;   ///< Max number of solutions to process before termination.
+    int numThreads_;     ///< Number of worker threads.
+    int frontierDepth_;  ///< Unused in dynamic mode.
 
-    // Shared across workers
-    TimetableSolution best_; ///< Best solution found so far.
+    // Shared state across workers
+    TimetableSolution best_;   ///< Best solution found so far.
     int bestScore_ = std::numeric_limits<int>::max(); ///< Score of best_ (lower is better).
-    int solutionsFound_ = 0; ///< Number of complete solutions found.
+    int solutionsFound_ = 0;   ///< Number of complete solutions found.
 
-    std::mutex bestMutex_; ///< Guards best_, bestScore_ and solutionsFound_.
-    std::mutex queueMutex_; ///< Guards access to frontierIndex_.
+    std::mutex bestMutex_;     ///< Guards best_, bestScore_ and solutionsFound_.
+    std::atomic<bool> found_{false}; ///< Signals early termination to all threads.
 
     std::vector<Activity> orderedActivities_; ///< Activities ordered for backtracking.
 
-    // Frontier of partial states at depth frontierDepth_
-    std::vector<std::unique_ptr<PartialState>> frontier_; ///< Shared pool of partial states.
-    size_t frontierIndex_ = 0; ///< Next frontier index to claim.
-
     /**
-     * @brief Compute a heuristic ordering of activities.
-     *
-     * Typically orders more constrained or harder activities first.
+     * @brief Compute a heuristic ordering of activities (hardest first).
      */
     void orderActivities(const ProblemInstance& inst);
 
     /**
-     * @brief Build the frontier_ vector using a sequential DFS up to frontierDepth_.
-     */
-    void buildFrontierSequential();
-
-    /**
-     * @brief Recursive DFS helper used while building the frontier.
+     * @brief Main recursive DFS with dynamic thread splitting.
      *
-     * @param state      Current incremental timetable state.
-     * @param placements Placements on the current path.
-     * @param depth      Current depth in orderedActivities_.
+     * At each activity assignment point, splits available worker threads across all feasible placements,
+     * spawning parallel tasks with balanced thread allocation, and sequential fallback when threads run out.
      */
-    void buildFrontierDFS(TimetableState& state,  std::vector<Placement>& placements, int depth);
-
-    /**
-     * @brief Main loop executed by each worker thread.
-     *
-     * Continuously claims partial states from frontier_ and explores them.
-     */
-    void workerLoop();
-
-    /**
-     * @brief Continue backtracking from a given partial state.
-     *
-     * @param partial Starting partial assignment for this search branch.
-     */
-    void backtrackFromPartial(const PartialState& partial);
+    void parallelDFS(TimetableState& state, std::vector<Placement>& placements, int depth, int threadsLeft);
 
     /**
      * @brief Compute the objective score of a complete timetable.

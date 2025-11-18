@@ -321,63 +321,51 @@ The sequential solver acts as the baseline for all performance comparisons.
 
 ### Shared-Memory Parallel Implementation (Threads)
 
-The threaded solver parallelizes backtracking by splitting the search tree at a **frontier depth** `D`.
+The threaded solver uses dynamic parallel recursion at every decision in the search tree.
 
-#### Decomposition
+- For every activity to be scheduled (recursion depth), all valid placements are enumerated.
+- The current pool of available threads is split across these feasible assignments (branches) at every recursive call:
+- If more than one thread is available and more than one choice exists, each branch is launched as a parallel async task, receiving a fair share of the threads.
+- If only one thread remains (or only one choice exists), the search continues sequentially (single-threaded).
+- Each parallel (async) branch gets its own copy of the TimetableState and placement vector.
+- Recursive splitting continues all the way down while threads remain, balancing work dynamically and maximizing core utilization.
 
-1. **Frontier generation (sequential):**
-    - Starting from an empty `TimetableState`, run DFS down to depth `D`.
-    - For each leaf at depth `D` (or when all activities are placed earlier), store a `PartialState`:
-        - `TimetableState state` (snapshot).
-        - `std::vector<Placement> placements`.
-        - `int depth` (next activity index).
-
-2. **Parallel exploration:**
-    - Create `numThreads` worker threads.
-    - Store all `PartialState` objects in a shared vector `frontier`.
-    - Use a shared index `frontierIndex` to distribute work:
-        - Each thread:
-            - Atomically claims `frontier[frontierIndex++]`.
-            - Copies its `state` and `placements`.
-            - Runs DFS from `depth` until the subtree is fully explored or `maxSolutions` is reached.
-
-This yields coarse-grained tasks: each task corresponds to exploring the subtree under one partial timetable.
-
-#### Execution
-
-Each worker executes:
+### Pseudo-structure:
 
 ```cpp
-void workerLoop() {
-    while (true) {
-        PartialState* ps = claimNextPartialState();
-        if (!ps) break;
-        backtrackFromPartial(*ps);
+void parallelDFS(state, placements, depth, threadsLeft) {
+    if (foundEnoughSolutions) return;
+    if (completeAssignment) { updateBestSolutionIfNeeded(); return; }
+    choices = allValidPlacementsForThisActivity();
+    if (threadsLeft <= 1 || choices.size() == 1) {
+        for each choice:
+            place, recurse, undo;
+    } else {
+        threadsPerBranch = fairPartition(threadsLeft, choices.size());
+        for each choice:
+            spawn async task:
+                parallelDFS(nextState, nextPlacements, depth+1, threadsPerBranch[choice]);
+        wait for all tasks;
     }
 }
 ```
+### Synchronization:
 
-`backtrackFromPartial` is structurally identical to the sequential DFS, starting from the recorded `depth` and using the copied `TimetableState` and placements.
+#### Early Termination:
+Uses an atomic boolean flag to signal all threads to stop once enough solutions have been found; all recursive and newly spawned branches check this flag before work.
 
-#### Synchronization
+#### Best Solution Updates:
+Whenever a thread finds a valid timetable, it computes its score and updates global best (solution, score, count) under a mutex lock for safety.
 
-- **Frontier distribution:**
-    - `frontierIndex` is protected by a mutex (`queueMutex`).
-    - Ensures each `PartialState` is processed exactly once.
+#### State Isolation:
+All mutable search states are per-thread/task (no sharing), except the global result variables.
 
-- **Shared best solution:**
-    - Shared global variables:
-        - `TimetableSolution best`.
-        - `int bestScore`.
-        - `int solutionsFound`.
-    - Updates protected by `bestMutex`:
-        - After a full timetable is found and passes `checkFinalWorkloadBounds()`, the worker computes the score and under the lock:
-            - If `score < bestScore`, update `best` and `bestScore`.
-            - Increment `solutionsFound`.
+#### Task Launching:
+Parallel splitting uses std::async to spawn branches, with total parallelism bounded by numThreads.
 
-- **State isolation:**
-    - Each worker has its own local copy of `TimetableState` and placement vector; there is no shared mutable search state.
-    - Only task distribution and best-solution variables are shared.
+**Advantages:**
+- This approach improves load balancing, eliminates idle/blocked threads, and adapts dynamically to tree irregularity—resulting in better scalability and throughput for large instances.
+- It avoids bottlenecks and contention typical in static frontier/queue splitting, and branches can exit as soon as a global solution is found.
 
 ***
 

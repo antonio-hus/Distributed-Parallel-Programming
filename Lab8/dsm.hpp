@@ -9,471 +9,346 @@
 #include <stdexcept>
 #include <algorithm>
 #include <queue>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 
 /**
- * Distributed Shared Memory (DSM) with Lamport Totally-Ordered Multicast.
+ * Distributed Shared Memory (DSM) Implementation — Replicated Model
  *
- * - Each process keeps a Lamport logical clock.
- * - A write or CAS is multicast to all subscribers of that variable with a (timestamp, sender, msg_id).
- * - All processes insert received messages into a priority queue ordered by (timestamp, sender, msg_id).
- * - Each process sends ACKs; a message is DELIVERED only when all subscribers have ACKed it
- *   and it is at the head of the queue.
- * - This yields the same global total order of updates (writes + CAS) on all subscribers,
- *   satisfying the lab requirement that all processes see the same callback sequence.
+ * - There are NUM_VARIABLES integer DSM variables, each process maintains a local copy.
+ * - All operations (write, CAS, read) are performed on local state, but must be delivered
+ *   in the same total order for all subscribers using Lamport clocks and acknowledgements.
+ * - Only subscribers can modify or receive notifications for a variable.
  */
 
+constexpr int NUM_PROCESSES = 4;
+constexpr int NUM_VARIABLES = 5;
+
 enum class MessageType {
-    UPDATE = 1,  // simple write(var, new_value)
-    CAS    = 2,  // compareAndSwap(var, expected, new_value)
-    ACK    = 3   // acknowledgement for total-order multicast
+    WRITE  = 1,
+    CAS    = 2,
+    ACK    = 3
 };
 
 class DistributedSharedMemory {
 public:
-    using ChangeCallback =
-            std::function<void(int variable_id, int old_value, int new_value, int lamport_time)>;
+    using ChangeCallback = std::function<void(int, int, int, int)>;
 
 private:
     int rank_;
     int world_size_;
     bool verbose_;
 
-    // Lamport logical clock
-    int lamport_clock_;
+    std::vector<int> variables_;
+    mutable std::mutex variable_mutex_;
 
-    // Per-process local copy of DSM variables
-    std::map<int, int> variables_;
-
-    // Static subscription sets: variable_id -> set of ranks
     std::map<int, std::set<int>> subscriptions_;
+    mutable std::mutex subscriptions_mutex_;
 
     ChangeCallback change_callback_;
+    std::mutex callback_mutex_;
 
-    // Per-process monotonically increasing ID for DSM messages
-    int next_message_id_;
+    std::atomic<int> lamport_clock_;
+    std::atomic<int> next_message_id_;
 
-    // Pending DSM operations waiting for total-order delivery
     struct PendingMessage {
-        int timestamp;      // Lamport timestamp assigned at send
-        int sender;         // original sender rank
-        int msg_id;         // per-sender unique id
-        MessageType type;   // UPDATE or CAS
+        int timestamp;
+        int sender;
+        int msg_id;
+        MessageType type;
         int var_id;
-        int new_value;      // for UPDATE and CAS
-        int expected;       // for CAS; ignored for UPDATE
+        int new_value;
+        int expected;
     };
 
     struct PendingCompare {
         bool operator()(const PendingMessage& a, const PendingMessage& b) const {
-            if (a.timestamp != b.timestamp) {
-                return a.timestamp > b.timestamp; // min-heap by timestamp
-            }
-            if (a.sender != b.sender) {
-                return a.sender > b.sender;       // tie-break by rank
-            }
-            return a.msg_id > b.msg_id;           // tie-break by local message id
+            if (a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+            if (a.sender != b.sender) return a.sender > b.sender;
+            return a.msg_id > b.msg_id;
         }
     };
 
-    std::priority_queue<PendingMessage,
-            std::vector<PendingMessage>,
-            PendingCompare> pending_messages_;
+    std::priority_queue<PendingMessage, std::vector<PendingMessage>, PendingCompare> pending_messages_;
+    mutable std::mutex pending_mutex_;
 
-    // For each (sender,msg_id) we track the ranks that have seen the message
-    // (origin is always implicitly considered to have seen it)
     std::map<std::pair<int,int>, std::set<int>> ack_sets_;
+    mutable std::mutex ack_mutex_;
 
-    // CAS result tracking for the originating process
     std::map<std::pair<int,int>, bool> cas_result_;
     std::map<std::pair<int,int>, bool> cas_done_;
+    std::mutex cas_mutex_;
+    std::condition_variable cas_cv_;
+
+    std::thread message_thread_;
+    std::atomic<bool> running_;
 
 public:
     DistributedSharedMemory(int rank, int world_size, bool verbose = false)
             : rank_(rank),
               world_size_(world_size),
               verbose_(verbose),
+              variables_(NUM_VARIABLES, 0),
               lamport_clock_(0),
-              next_message_id_(0) {
-        if (verbose_) log("DSM initialized (no sequencer, Lamport total order)");
+              next_message_id_(0),
+              running_(true)
+    {
+        if (world_size != NUM_PROCESSES) {
+            throw std::runtime_error("World size must be " + std::to_string(NUM_PROCESSES));
+        }
+
+        if (verbose_) {
+            log("DSM initialized with " + std::to_string(NUM_VARIABLES) + " variables per process.");
+        }
+
+        message_thread_ = std::thread(&DistributedSharedMemory::messageProcessingLoop, this);
     }
 
+    ~DistributedSharedMemory() {
+        running_ = false;
+        if (message_thread_.joinable()) message_thread_.join();
+    }
+
+    DistributedSharedMemory(const DistributedSharedMemory&) = delete;
+    DistributedSharedMemory& operator=(const DistributedSharedMemory&) = delete;
+
     void subscribe(int variable_id, const std::set<int>& subscriber_ranks) {
+        if (variable_id < 0 || variable_id >= NUM_VARIABLES) {
+            throw std::runtime_error("Variable ID out of range");
+        }
         if (subscriber_ranks.find(rank_) == subscriber_ranks.end()) {
-            throw std::runtime_error("Process must be in the subscriber list to subscribe.");
+            throw std::runtime_error("Process must be a subscriber to subscribe.");
         }
-        subscriptions_[variable_id] = subscriber_ranks;
-        variables_[variable_id] = 0;
+        {
+            std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+            subscriptions_[variable_id] = subscriber_ranks;
+        }
+        if (verbose_) log("Subscribed to variable " + std::to_string(variable_id));
         incrementClock();
-        if (verbose_) {
-            log("Subscribed to variable " + std::to_string(variable_id) +
-                " | Clock=" + std::to_string(lamport_clock_));
-        }
     }
 
     void setChangeCallback(ChangeCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         change_callback_ = callback;
     }
 
     int read(int variable_id) {
-        auto it = variables_.find(variable_id);
-        if (it == variables_.end()) {
-            throw std::runtime_error("Variable not subscribed or found.");
-        }
+        if (variable_id < 0 || variable_id >= NUM_VARIABLES)
+            throw std::runtime_error("Invalid variable id");
         incrementClock();
-        return it->second;
+        std::lock_guard<std::mutex> lock(variable_mutex_);
+        return variables_[variable_id];
     }
 
-    // Simple write: totally ordered multicast to all subscribers of the variable
     void write(int variable_id, int new_value) {
         ensureSubscribed(variable_id);
-
         incrementClock();
-        int timestamp = lamport_clock_;
+        int timestamp = lamport_clock_.load();
         int msg_id = next_message_id_++;
-
-        PendingMessage msg{
-                timestamp,
-                rank_,
-                msg_id,
-                MessageType::UPDATE,
-                variable_id,
-                new_value,
-                0 // expected not used for UPDATE
-        };
-
-        // Insert locally into pending queue
-        pending_messages_.push(msg);
-
-        // Origin has trivially seen its own message
-        auto key = std::make_pair(rank_, msg_id);
-        ack_sets_[key].insert(rank_);
-
-        // Multicast to all other subscribers of this variable
-        const auto& subscribers = subscriptions_.at(variable_id);
-        std::vector<int> buffer = {
-                (int)MessageType::UPDATE,
-                variable_id,
-                new_value,
-                0,             // expected unused
-                rank_,         // original sender
-                msg_id,
-                timestamp
-        };
-
-        for (int dest : subscribers) {
-            if (dest == rank_) continue; // local already added
-            MPI_Send(buffer.data(), (int)buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
+        PendingMessage msg{timestamp, rank_, msg_id, MessageType::WRITE, variable_id, new_value, 0};
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_messages_.push(msg);
         }
-
-        if (verbose_) {
-            log("WRITE var " + std::to_string(variable_id) +
-                " = " + std::to_string(new_value) +
-                " | T=" + std::to_string(timestamp));
-        }
-    }
-
-    // CAS: totally ordered, returns success/failure after the CAS is globally ordered and applied
-    bool compareAndSwap(int variable_id, int expected, int new_value) {
-        ensureSubscribed(variable_id);
-
-        incrementClock();
-        int timestamp = lamport_clock_;
-        int msg_id = next_message_id_++;
-
-        PendingMessage msg{
-                timestamp,
-                rank_,
-                msg_id,
-                MessageType::CAS,
-                variable_id,
-                new_value,
-                expected
-        };
-
-        // Insert locally into pending queue
-        pending_messages_.push(msg);
-
         auto key = std::make_pair(rank_, msg_id);
-        ack_sets_[key].insert(rank_);  // origin has seen its own message
-
-        // Mark CAS as not yet decided
-        cas_done_[key] = false;
-        cas_result_[key] = false;
-
-        // Multicast CAS to all other subscribers
-        const auto& subscribers = subscriptions_.at(variable_id);
-        std::vector<int> buffer = {
-                (int)MessageType::CAS,
-                variable_id,
-                new_value,
-                expected,
-                rank_,     // original sender
-                msg_id,
-                timestamp
-        };
-
+        {
+            std::lock_guard<std::mutex> lock(ack_mutex_);
+            ack_sets_[key].insert(rank_);
+        }
+        std::set<int> subscribers = getSubscribers(variable_id);
+        std::vector<int> buffer = {(int)MessageType::WRITE, variable_id, new_value, 0, rank_, msg_id, timestamp};
         for (int dest : subscribers) {
             if (dest == rank_) continue;
-            MPI_Send(buffer.data(), (int)buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
+            MPI_Send(buffer.data(), buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
         }
+        if (verbose_) log("WRITE var=" + std::to_string(variable_id) + " value=" + std::to_string(new_value) + " | T=" + std::to_string(timestamp));
+    }
 
-        if (verbose_) {
-            log("CAS request var " + std::to_string(variable_id) +
-                " expected=" + std::to_string(expected) +
-                " new=" + std::to_string(new_value) +
-                " | T=" + std::to_string(timestamp));
+    bool compareAndSwap(int variable_id, int expected, int new_value) {
+        ensureSubscribed(variable_id);
+        incrementClock();
+        int timestamp = lamport_clock_.load();
+        int msg_id = next_message_id_++;
+        PendingMessage msg{timestamp, rank_, msg_id, MessageType::CAS, variable_id, new_value, expected};
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_messages_.push(msg);
         }
-
-        // Wait until this CAS is delivered in total order and decided
-        while (!cas_done_[key]) {
-            processMessages();
+        auto key = std::make_pair(rank_, msg_id);
+        {
+            std::lock_guard<std::mutex> lock(ack_mutex_);
+            ack_sets_[key].insert(rank_);
         }
-
+        {
+            std::lock_guard<std::mutex> lock(cas_mutex_);
+            cas_result_[key] = false;
+            cas_done_[key] = false;
+        }
+        std::set<int> subscribers = getSubscribers(variable_id);
+        std::vector<int> buffer = {(int)MessageType::CAS, variable_id, new_value, expected, rank_, msg_id, timestamp};
+        for (int dest : subscribers) {
+            if (dest == rank_) continue;
+            MPI_Send(buffer.data(), buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
+        }
+        if (verbose_) log("CAS var=" + std::to_string(variable_id) + " expected=" + std::to_string(expected) + " new=" + std::to_string(new_value) + " | T=" + std::to_string(timestamp));
+        std::unique_lock<std::mutex> lock(cas_mutex_);
+        cas_cv_.wait(lock, [this, key] { return cas_done_[key]; });
         bool success = cas_result_[key];
         cas_done_.erase(key);
         cas_result_.erase(key);
-
-        if (verbose_) {
-            log(std::string("CAS result var ") + std::to_string(variable_id) +
-                " -> " + (success ? "SUCCESS" : "FAILED"));
-        }
-
+        if (verbose_) log("CAS result: " + std::string(success ? "SUCCESS" : "FAILED"));
         return success;
     }
 
-    // Must be called periodically by the main program to receive and deliver messages
+    int getLamportClock() const { return lamport_clock_.load(); }
+
+private:
+    void incrementClock() { lamport_clock_++; }
+
+    std::set<int> getSubscribers(int variable_id) const {
+        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        auto it = subscriptions_.find(variable_id);
+        if (it == subscriptions_.end()) return {};
+        return it->second;
+    }
+    void ensureSubscribed(int variable_id) const {
+        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        auto it = subscriptions_.find(variable_id);
+        if (it == subscriptions_.end() || it->second.find(rank_) == it->second.end()) {
+            throw std::runtime_error("Process not subscribed to variable " + std::to_string(variable_id));
+        }
+    }
+
+    void messageProcessingLoop() {
+        while (running_) {
+            processMessages();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
     void processMessages() {
         int flag = 0;
         MPI_Status status;
-
-        // Receive all currently available messages
         MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
-        while (flag) {
+        while (flag && running_) {
             int count = 0;
             MPI_Get_count(&status, MPI_INT, &count);
             std::vector<int> buffer(count);
-
-            MPI_Recv(buffer.data(), count, MPI_INT,
-                     status.MPI_SOURCE, status.MPI_TAG,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
+            MPI_Recv(buffer.data(), count, MPI_INT, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MessageType type = (MessageType)buffer[0];
-            int var_id       = buffer[1];
-            int new_value    = buffer[2];
-            int expected     = buffer[3];
+            int var_id = buffer[1];
+            int new_value = buffer[2];
+            int expected = buffer[3];
             int original_sender = buffer[4];
-            int msg_id       = buffer[5];
+            int msg_id = buffer[5];
             int msg_timestamp = buffer[6];
-
-            // Update Lamport clock on receive
-            lamport_clock_ = std::max(lamport_clock_, msg_timestamp) + 1;
-
-            if (type == MessageType::UPDATE || type == MessageType::CAS) {
-                handleDsmMessage(type,
-                                 var_id,
-                                 new_value,
-                                 expected,
-                                 original_sender,
-                                 msg_id,
-                                 msg_timestamp);
+            lamport_clock_ = std::max(lamport_clock_.load(), msg_timestamp) + 1;
+            if (type == MessageType::WRITE || type == MessageType::CAS) {
+                handleOperationMessage(type, var_id, new_value, expected, original_sender, msg_id, msg_timestamp);
             } else if (type == MessageType::ACK) {
-                handleAckMessage(var_id,
-                                 original_sender,
-                                 msg_id,
-                                 status.MPI_SOURCE);
+                handleAckMessage(var_id, original_sender, msg_id, status.MPI_SOURCE);
             }
-
-            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG,
-                       MPI_COMM_WORLD, &flag, &status);
+            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
         }
-
-        // Try to deliver messages in total order
         deliverPendingMessages();
     }
-
-    int getLamportClock() const {
-        return lamport_clock_;
-    }
-
-private:
-    void incrementClock() {
-        lamport_clock_++;
-    }
-
-    void ensureSubscribed(int variable_id) const {
-        auto it = subscriptions_.find(variable_id);
-        if (it == subscriptions_.end() ||
-            it->second.find(rank_) == it->second.end()) {
-            throw std::runtime_error("Process not subscribed to this variable.");
+    void handleOperationMessage(MessageType type, int var_id, int new_value, int expected, int original_sender, int msg_id, int msg_timestamp) {
+        std::set<int> subscribers = getSubscribers(var_id);
+        if (subscribers.empty() || subscribers.find(rank_) == subscribers.end()) return;
+        PendingMessage msg{msg_timestamp, original_sender, msg_id, type, var_id, new_value, expected};
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_messages_.push(msg);
         }
-    }
-
-    void handleDsmMessage(MessageType type,
-                          int var_id,
-                          int new_value,
-                          int expected,
-                          int original_sender,
-                          int msg_id,
-                          int msg_timestamp) {
-        // Ignore messages for variables this process does not know about
-        auto subs_it = subscriptions_.find(var_id);
-        if (subs_it == subscriptions_.end()) {
-            return;
-        }
-
-        PendingMessage msg{
-                msg_timestamp,
-                original_sender,
-                msg_id,
-                type,
-                var_id,
-                new_value,
-                expected
-        };
-
-        pending_messages_.push(msg);
-
         auto key = std::make_pair(original_sender, msg_id);
-        auto& ack_set = ack_sets_[key];
-
-        // Origin has trivially seen the message
-        ack_set.insert(original_sender);
-        // This receiver has now seen it
-        ack_set.insert(rank_);
-
-        // Send ACK to all subscribers of this variable
-        const auto& subscribers = subs_it->second;
-        std::vector<int> ack_buffer = {
-                (int)MessageType::ACK,
-                var_id,
-                0,          // unused
-                0,          // unused
-                original_sender,
-                msg_id,
-                lamport_clock_
-        };
-
+        {
+            std::lock_guard<std::mutex> lock(ack_mutex_);
+            ack_sets_[key].insert(original_sender);
+            ack_sets_[key].insert(rank_);
+        }
+        std::vector<int> ack_buffer = {(int)MessageType::ACK, var_id, 0, 0, original_sender, msg_id, lamport_clock_.load()};
         for (int dest : subscribers) {
             if (dest == rank_) continue;
-            MPI_Send(ack_buffer.data(), (int)ack_buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
+            MPI_Send(ack_buffer.data(), ack_buffer.size(), MPI_INT, dest, 0, MPI_COMM_WORLD);
         }
-
-        if (verbose_) {
-            log("Received DSM msg type=" + std::to_string((int)type) +
-                " var=" + std::to_string(var_id) +
-                " from " + std::to_string(original_sender) +
-                " msg_id=" + std::to_string(msg_id) +
-                " | T=" + std::to_string(msg_timestamp));
-        }
+        if (verbose_) log("RECEIVE " + std::string(type == MessageType::WRITE ? "WRITE" : "CAS") +
+                          " from " + std::to_string(original_sender) +
+                          " var=" + std::to_string(var_id) +
+                          " T=" + std::to_string(msg_timestamp));
     }
-
-    void handleAckMessage(int var_id,
-                          int original_sender,
-                          int msg_id,
-                          int ack_sender) {
-        auto subs_it = subscriptions_.find(var_id);
-        if (subs_it == subscriptions_.end()) {
-            return;
-        }
-
+    void handleAckMessage(int var_id, int original_sender, int msg_id, int ack_sender) {
+        std::set<int> subscribers = getSubscribers(var_id);
+        if (subscribers.empty() || subscribers.find(rank_) == subscribers.end()) return;
         auto key = std::make_pair(original_sender, msg_id);
-        auto& ack_set = ack_sets_[key];
-
-        // Origin always considered to have seen the message
-        ack_set.insert(original_sender);
-        // The sender of this ACK has seen it
-        ack_set.insert(ack_sender);
-
-        if (verbose_) {
-            log("ACK for msg (" + std::to_string(original_sender) +
-                "," + std::to_string(msg_id) +
-                ") from " + std::to_string(ack_sender));
+        {
+            std::lock_guard<std::mutex> lock(ack_mutex_);
+            ack_sets_[key].insert(original_sender);
+            ack_sets_[key].insert(ack_sender);
         }
     }
-
     bool haveAllAcks(const PendingMessage& msg) const {
-        auto subs_it = subscriptions_.find(msg.var_id);
-        if (subs_it == subscriptions_.end()) return false;
-
+        std::set<int> subscribers = getSubscribers(msg.var_id);
+        if (subscribers.empty()) return false;
         auto key = std::make_pair(msg.sender, msg.msg_id);
+        std::lock_guard<std::mutex> lock(ack_mutex_);
         auto ack_it = ack_sets_.find(key);
         if (ack_it == ack_sets_.end()) return false;
-
-        const auto& subscribers = subs_it->second;
         const auto& ack_set = ack_it->second;
-
-        for (int r : subscribers) {
-            if (ack_set.find(r) == ack_set.end()) {
-                return false;
-            }
+        for (int subscriber : subscribers) {
+            if (ack_set.find(subscriber) == ack_set.end()) return false;
         }
         return true;
     }
-
     void deliverPendingMessages() {
-        bool delivered = true;
-
-        // Keep delivering while the top message is deliverable
-        while (delivered && !pending_messages_.empty()) {
-            delivered = false;
-            const PendingMessage& top = pending_messages_.top();
-
-            if (!haveAllAcks(top)) {
-                // Cannot yet deliver; some subscribers did not ACK
-                break;
+        while (true) {
+            PendingMessage msg;
+            bool deliver = false;
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex_);
+                if (pending_messages_.empty()) break;
+                const PendingMessage& top = pending_messages_.top();
+                if (!haveAllAcks(top)) break;
+                msg = top;
+                pending_messages_.pop();
+                deliver = true;
             }
-
-            PendingMessage msg = top;
-            pending_messages_.pop();
-            delivered = true;
-
-            int old_val = variables_[msg.var_id];
-            bool cas_success = false;
-
-            if (msg.type == MessageType::UPDATE) {
+            if (!deliver) break;
+            deliverMessage(msg);
+        }
+    }
+    void deliverMessage(const PendingMessage& msg) {
+        int old_value;
+        {
+            std::lock_guard<std::mutex> lock(variable_mutex_);
+            old_value = variables_[msg.var_id];
+            bool success = true;
+            if (msg.type == MessageType::WRITE) {
                 variables_[msg.var_id] = msg.new_value;
-                if (verbose_) {
-                    log("DELIVER UPDATE var " + std::to_string(msg.var_id) +
-                        ": " + std::to_string(old_val) +
-                        " -> " + std::to_string(msg.new_value) +
-                        " | T=" + std::to_string(msg.timestamp));
-                }
-                if (change_callback_) {
-                    change_callback_(msg.var_id, old_val, msg.new_value, msg.timestamp);
-                }
             } else if (msg.type == MessageType::CAS) {
                 if (variables_[msg.var_id] == msg.expected) {
                     variables_[msg.var_id] = msg.new_value;
-                    cas_success = true;
-                    if (verbose_) {
-                        log("DELIVER CAS SUCCESS var " + std::to_string(msg.var_id) +
-                            ": " + std::to_string(old_val) +
-                            " -> " + std::to_string(msg.new_value) +
-                            " | T=" + std::to_string(msg.timestamp));
-                    }
-                    if (change_callback_) {
-                        change_callback_(msg.var_id, old_val, msg.new_value, msg.timestamp);
-                    }
+                    success = true;
                 } else {
-                    if (verbose_) {
-                        log("DELIVER CAS FAIL var " + std::to_string(msg.var_id) +
-                            " expected=" + std::to_string(msg.expected) +
-                            " current=" + std::to_string(old_val) +
-                            " | T=" + std::to_string(msg.timestamp));
-                    }
+                    success = false;
                 }
-
-                // If this process originated the CAS, record the result
                 if (msg.sender == rank_) {
                     auto key = std::make_pair(msg.sender, msg.msg_id);
-                    cas_result_[key] = cas_success;
+                    std::lock_guard<std::mutex> lock_cas(cas_mutex_);
+                    cas_result_[key] = success;
                     cas_done_[key] = true;
+                    cas_cv_.notify_all();
                 }
             }
         }
+        // Notify callback (lock is dropped above)
+        invokeCallback(msg.var_id, old_value, variables_[msg.var_id], msg.timestamp);
     }
-
+    void invokeCallback(int var_id, int old_value, int new_value, int ts) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        if (change_callback_) change_callback_(var_id, old_value, new_value, ts);
+    }
     void log(const std::string& message) const {
-        std::cout << "[Rank " << rank_ << "] " << message << std::endl;
+        std::cout << "[Rank " << rank_ << "] " << message << std::endl << std::flush;
     }
 };

@@ -1,3 +1,6 @@
+/////////////////////
+///    IMPORTS    ///
+/////////////////////
 #include "dsm.hpp"
 #include <iostream>
 #include <thread>
@@ -5,6 +8,11 @@
 #include <vector>
 #include <mpi.h>
 
+
+/////////////////////
+///    STRUCTS    ///
+/////////////////////
+// Event log for multiple-rank consistency verification
 struct EventLog {
     int rank;
     int variable_id;
@@ -14,8 +22,13 @@ struct EventLog {
 };
 std::vector<EventLog> event_sequence;
 
+
+/////////////////////
+///   SCENARIOS   ///
+/////////////////////
+// Scenario 1: Concurrent writes to a globally shared variable (var 0)
 void runScenario1(DistributedSharedMemory& dsm, int rank) {
-    std::cout << "[Rank " << rank << "] Scenario 1: Sequential Consistency\n" << std::flush;
+    std::cout << "[Rank " << rank << "] Scenario 1: Sequential Consistency\n";
     if (rank == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         dsm.write(0, 100);
@@ -31,10 +44,9 @@ void runScenario1(DistributedSharedMemory& dsm, int rank) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
+// Scenario 2: Write to a variable (var 2) subscribed ONLY by ranks {0,2,3}
 void runPartialSubscriptionScenario(DistributedSharedMemory& dsm, int rank) {
-    // Shows that only subscribers of var2 {0,2,3} may write/read/callback
-    std::cout << "[Rank " << rank << "] Scenario 2: Partial Subscription (local group for var2)\n" << std::flush;
-    // Only these ranks subscribe to var 2; others (like 1) are NOT allowed to write!
+    std::cout << "[Rank " << rank << "] Scenario 2: Partial Subscription (var2 local group)\n";
     if (rank == 0) {
         dsm.write(2, 42);
     } else if (rank == 2) {
@@ -44,12 +56,12 @@ void runPartialSubscriptionScenario(DistributedSharedMemory& dsm, int rank) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         dsm.write(2, 168);
     }
-    // Rank 1 cannot write: not subscribed, would throw if attempted!
+    // Rank 1 is NOT subscribed, does not write var2!
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 }
 
+// Scenario 3: var 1 is a global variable, all processes write in sequence
 void runGlobalVarsScenario(DistributedSharedMemory& dsm, int rank) {
-    // var 1 is global, all can write
     if (rank == 1) {
         dsm.write(1, 10);
     } else if (rank == 2) {
@@ -59,40 +71,52 @@ void runGlobalVarsScenario(DistributedSharedMemory& dsm, int rank) {
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 }
 
+// Scenario 4: CAS atomicity demonstration on var 3
 void runScenario3(DistributedSharedMemory& dsm, int rank) {
-    std::cout << "[Rank " << rank << "] Scenario 3: CAS Atomicity\n" << std::flush;
+    std::cout << "[Rank " << rank << "] Scenario 3: CAS Atomicity\n";
     std::this_thread::sleep_for(std::chrono::milliseconds(35 * rank));
-    bool success = dsm.compareAndSwap(3, 0, 20 + 10*rank);
-    std::cout << "[Rank " << rank << "] CAS(3, 0, " << (20 + 10*rank) << ") = " << (success ? "SUCCESS" : "FAILED") << "\n" << std::flush;
+    int candidate = 20 + 10 * rank;
+    bool success = dsm.compareAndSwap(3, 0, candidate);
+    std::cout << "[Rank " << rank << "] CAS(3, 0, " << candidate << ") = "
+              << (success ? "SUCCESS" : "FAILED") << "\n";
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     if (rank == 2) {
         int v = dsm.read(3);
-        std::cout << "[Rank 2] After first CAS, var 3 = " << v << "\n" << std::flush;
+        std::cout << "[Rank 2] After first CAS, var 3 = " << v << "\n";
         success = dsm.compareAndSwap(3, v, 777);
-        std::cout << "[Rank 2] CAS(3, " << v << ", 777) = " << (success ? "SUCCESS" : "FAILED") << "\n" << std::flush;
+        std::cout << "[Rank 2] CAS(3, " << v << ", 777) = "
+                  << (success ? "SUCCESS" : "FAILED") << "\n";
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 }
 
+// Scenario 5: Demonstrates Lamport happens-before on var 4
 void runScenario4(DistributedSharedMemory& dsm, int rank) {
-    std::cout << "[Rank " << rank << "] Scenario 4: Happens-Before\n" << std::flush;
+    std::cout << "[Rank " << rank << "] Scenario 4: Happens-Before\n";
     if (rank == 0) {
         dsm.write(4, 1);
-        std::cout << "[Rank 0] Event A: write(4, 1) | Clock=" << dsm.getLamportClock() << "\n" << std::flush;
+        std::cout << "[Rank 0] Event A: write(4, 1) | Clock=" << dsm.getLamportClock() << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         dsm.write(4, 2);
-        std::cout << "[Rank 0] Event B: write(4, 2) | Clock=" << dsm.getLamportClock() << "\n" << std::flush;
+        std::cout << "[Rank 0] Event B: write(4, 2) | Clock=" << dsm.getLamportClock() << "\n";
     } else if (rank == 1) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         dsm.write(4, 3);
-        std::cout << "[Rank 1] Event C: write(4, 3) | Clock=" << dsm.getLamportClock() << "\n" << std::flush;
+        std::cout << "[Rank 1] Event C: write(4, 3) | Clock=" << dsm.getLamportClock() << "\n";
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
 }
 
+
+/////////////////////
+///    HELPERS    ///
+/////////////////////
+// Utility: Which variables are globally subscribed by all ranks
 static bool is_globally_shared_var(int var_id) {
     return var_id == 0 || var_id == 1 || var_id == 3 || var_id == 4;
 }
+
+// Global consistency check for callback sequence (should match for all ranks)
 void verifySequentialConsistency(int rank, int world_size) {
     int local_event_count = 0;
     for (const auto& e : event_sequence)
@@ -119,6 +143,10 @@ void verifySequentialConsistency(int rank, int world_size) {
     }
 }
 
+
+/////////////////////
+///     ENTRY     ///
+/////////////////////
 int main(int argc, char** argv) {
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -127,14 +155,17 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
+    // Ensure required number of ranks
     if (world_size != NUM_PROCESSES) {
         if (rank == 0)
             std::cerr << "Error: Requires exactly " << NUM_PROCESSES << " MPI processes!\n";
         MPI_Finalize();
         return 1;
     }
+    // DSM with local replication of all variables, Lamport consistency
     DistributedSharedMemory dsm(rank, world_size, false);
 
+    // Build subscription groups
     std::set<int> all_ranks;
     for (int i = 0; i < world_size; ++i) all_ranks.insert(i);
     std::set<int> subs_var2 = {0, 2, 3};
@@ -144,17 +175,19 @@ int main(int argc, char** argv) {
     dsm.subscribe(3, all_ranks);
     dsm.subscribe(4, all_ranks);
 
+    // Logging callback for every variable update
     dsm.setChangeCallback([rank](int var_id, int old_val, int new_val, int lamport_time) {
         std::cout << "[Rank " << rank << "] CALLBACK: Var " << var_id
                   << ": " << old_val << " -> " << new_val
-                  << " | T=" << lamport_time << "\n" << std::flush;
+                  << " | T=" << lamport_time << "\n";
         event_sequence.push_back({rank, var_id, old_val, new_val, lamport_time});
     });
 
     MPI_Barrier(MPI_COMM_WORLD);
+
     if (rank == 0) {
         std::cout << "\n=============================================\n";
-        std::cout << "DISTRIBUTED SHARED MEMORY — LAB 8\n";
+        std::cout << "DISTRIBUTED SHARED MEMORY - LAB 8\n";
         std::cout << "Lamport Total-Order Multicast, Replicated Model\n";
         std::cout << "Processes: " << world_size << "\n";
         std::cout << "Variables per process: " << NUM_VARIABLES << "\n";
@@ -162,18 +195,23 @@ int main(int argc, char** argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // Global concurrent write
     runScenario1(dsm, rank);
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // Local group write
     runPartialSubscriptionScenario(dsm, rank);
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // All ranks may write to a global variable
     runGlobalVarsScenario(dsm, rank);
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // CAS atomicity
     runScenario3(dsm, rank);
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // Happens-before
     runScenario4(dsm, rank);
     MPI_Barrier(MPI_COMM_WORLD);
 
